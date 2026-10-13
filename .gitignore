@@ -13,3 +13,12 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Release signing secrets
+keystore.properties
+*.jks
+*.keystore
+
+# IDE and Kotlin daemon state
+.idea/
+.kotlin/
