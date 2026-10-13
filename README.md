@@ -1,6 +1,6 @@
-# Impact AI - On-Device LLM Chatbot
+# TinyAI - On-Device LLM Chatbot
 
-Impact AI is a privacy-first, fully offline Android application that allows users to run Large Language Models (LLMs) locally on their mobile devices. It utilizes native C++ bindings for high-performance inference without requiring an internet connection.
+TinyAI is a privacy-first, fully offline Android application that allows users to run Large Language Models (LLMs) locally on their mobile devices. It utilizes native C++ bindings for high-performance inference without requiring an internet connection.
 
 ## 🚀 Features
 

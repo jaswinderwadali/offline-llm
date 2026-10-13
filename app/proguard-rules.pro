@@ -19,3 +19,6 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# llama.cpp JNI bindings: native code calls back into these classes by name.
+-keep class org.nehuatl.llamacpp.** { *; }
+-keepclasseswithmembernames class * { native <methods>; }
