@@ -34,7 +34,7 @@ android {
         targetSdk = 36
         // CI passes -PversionCode=<run number> so every Play upload gets a unique, increasing code.
         versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
-        versionName = "1.0.0"
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -25,6 +25,7 @@ class AppPreferences(context: Context) {
         private const val KEY_WORD_LIMIT = "word_limit"
         private const val KEY_MODEL_URI = "model_uri"
         private const val KEY_MODEL_NAME = "model_name"
+        private const val KEY_MODEL_LOADING = "model_loading_name"
         private const val KEY_THEME = "theme_mode"
         private const val KEY_USE_MEMORY = "use_memory"
         private const val KEY_AUTO_MEMORY = "auto_memory"
@@ -120,6 +121,14 @@ class AppPreferences(context: Context) {
 
     fun setModel(uri: String?, name: String?) {
         prefs.edit().putString(KEY_MODEL_URI, uri).putString(KEY_MODEL_NAME, name).apply()
+    }
+
+    /** Name of a model whose first load never finished. Still set at launch means loading it killed the app. */
+    val interruptedModelLoad: String? get() = prefs.getString(KEY_MODEL_LOADING, null)
+
+    fun setModelLoading(name: String?) {
+        // commit(), not apply(): the process can be killed mid-load, before an async write reaches disk.
+        prefs.edit().putString(KEY_MODEL_LOADING, name).commit()
     }
 
     fun saveCustomPersona(persona: Persona) {

@@ -1,9 +1,11 @@
 package ai.impact
 
+import android.app.ActivityManager
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.text.format.Formatter
 import android.util.Log
 import ai.impact.data.BuiltInPersonas
 import ai.impact.data.Persona
@@ -16,6 +18,7 @@ import ai.impact.data.memory.MemorySource
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import org.nehuatl.llamacpp.LlamaHelper
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -59,6 +62,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val TAG = "ChatViewModel"
         private const val CONTEXT_LENGTH = 2048
         private const val CHARS_PER_TOKEN = 3.5
+        // Largest model file, as a share of total device RAM, that we'll try to load.
+        private const val MAX_MODEL_RAM_FRACTION = 0.6
 
         // Markers that mean the model has finished its turn and started hallucinating the next one.
         private val STOP_MARKERS = listOf(
@@ -125,7 +130,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _llmFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(extraBufferCapacity = 256)
 
     // Background scope for LlamaHelper so native work never blocks the UI thread.
-    private val backgroundScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // The handler keeps engine failures that aren't Exceptions (e.g. UnsatisfiedLinkError) from crashing the app.
+    private val backgroundScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+            Log.e(TAG, "Engine failure", e)
+            if (_modelState.value is ModelState.Loading) {
+                onModelLoadFailed("Couldn't load the model: ${e.message ?: "unknown error"}")
+            }
+        }
+    )
     private val llamaHelper = LlamaHelper(application.contentResolver, backgroundScope, _llmFlow)
 
     init {
@@ -154,6 +167,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ?: BuiltInPersonas.all.first()
 
     private fun handleEvent(event: LlamaHelper.LLMEvent) {
+        val loading = _modelState.value as? ModelState.Loading
+        if (event is LlamaHelper.LLMEvent.Error && loading != null) {
+            Log.e(TAG, "Model load failed: ${event.message}")
+            onModelLoadFailed("Couldn't load \"${loading.name}\". The file may be incomplete or not a supported model.")
+            return
+        }
         val session = generating ?: return
         when (event) {
             is LlamaHelper.LLMEvent.Ongoing -> {
@@ -214,6 +233,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // region Model loading
 
     private fun restoreSavedModel() {
+        preferences.interruptedModelLoad?.let { name ->
+            // The app died while loading this model last time, so say why instead of failing silently.
+            preferences.setModelLoading(null)
+            _modelState.value = ModelState.Error(
+                "The app closed while loading \"$name\". It probably needs more memory than this device has. Try a smaller model."
+            )
+            return
+        }
         val saved = preferences.modelUri ?: return
         val uri = Uri.parse(saved)
         val hasPermission = getApplication<Application>().contentResolver.persistedUriPermissions
@@ -251,25 +278,63 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        tooLargeMessage(uri, name)?.let {
+            _modelState.value = ModelState.Error(it)
+            return
+        }
+
+        stopGeneration()
         _modelState.value = ModelState.Loading(name)
-        if (persist) preferences.setModel(uri.toString(), name)
 
         viewModelScope.launch(Dispatchers.IO) {
+            // Only a first-time load is marked: a model that has loaded before is known to fit.
+            if (persist) preferences.setModelLoading(name)
             try {
+                // Drop the previous model ourselves so LlamaHelper never keeps a stale context id.
+                try {
+                    llamaHelper.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Release failed", e)
+                }
                 llamaHelper.load(
                     path = uri.toString(),
                     contextLength = CONTEXT_LENGTH,
                     loaded = {
                         Log.d(TAG, "Model loaded")
+                        preferences.setModelLoading(null)
+                        // Saved only once it works, so a model that crashes the app is never auto-loaded at launch.
+                        if (persist) preferences.setModel(uri.toString(), name)
                         _modelState.value = ModelState.Ready(name)
                     }
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load model", e)
-                _modelState.value = ModelState.Error("Couldn't load the model: ${e.message ?: "unknown error"}")
-                preferences.setModel(null, null)
+                onModelLoadFailed("Couldn't load the model: ${e.message ?: "unknown error"}")
             }
         }
+    }
+
+    private fun onModelLoadFailed(message: String) {
+        preferences.setModelLoading(null)
+        _modelState.value = ModelState.Error(message)
+    }
+
+    /**
+     * The engine reads the whole file into RAM rather than memory-mapping it, so a model that
+     * doesn't fit gets the app killed by the system instead of failing with an error.
+     */
+    private fun tooLargeMessage(uri: Uri, name: String): String? {
+        val context = getApplication<Application>()
+        val size = try {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        val memory = ActivityManager.MemoryInfo()
+        context.getSystemService(ActivityManager::class.java).getMemoryInfo(memory)
+        if (size <= memory.totalMem * MAX_MODEL_RAM_FRACTION) return null
+        return "\"$name\" is ${Formatter.formatShortFileSize(context, size)}, too large for this device's " +
+            "${Formatter.formatShortFileSize(context, memory.totalMem)} of memory. Try a smaller model."
     }
 
     fun unloadModel() {
