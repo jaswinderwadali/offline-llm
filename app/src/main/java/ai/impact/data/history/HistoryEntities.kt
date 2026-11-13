@@ -36,7 +36,11 @@ data class MessageEntity(
     val isUser: Boolean,
     val text: String,
     val createdAt: Long,
-    val thinkingMillis: Long? = null
+    val thinkingMillis: Long? = null,
+    /** Gallery id of an image the assistant generated for this message (added in version 2). */
+    val imageId: String? = null,
+    val imageWidth: Int? = null,
+    val imageHeight: Int? = null
 )
 
 /** A conversation row for the history list, with its newest message as a preview. */

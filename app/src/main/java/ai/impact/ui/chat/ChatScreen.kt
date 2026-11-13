@@ -71,6 +71,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -102,6 +103,10 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
+import ai.impact.ChatMode
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -123,13 +128,22 @@ fun ChatScreen(
     onOpenSettings: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenMemory: () -> Unit,
+    onOpenImageStudio: () -> Unit,
     onRememberMessage: (String) -> Unit,
-    memoryEvents: Flow<MemoryEntity>
+    memoryEvents: Flow<MemoryEntity>,
+    chatMode: ChatMode,
+    onChatModeChange: (ChatMode) -> Unit,
+    hasImageModel: Boolean,
+    onGetImageModel: () -> Unit,
+    images: ChatImageActions
 ) {
     var input by rememberSaveable { mutableStateOf("") }
     var showSwitcher by rememberSaveable { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val isReady = modelState is ModelState.Ready
+    val imageMode = chatMode == ChatMode.Image
+    // Image mode only needs an image model; the chat model is optional (it can polish prompts).
+    val canSend = if (imageMode) hasImageModel else isReady
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(memoryEvents) {
@@ -146,8 +160,9 @@ fun ChatScreen(
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }
-    LaunchedEffect(messages.lastOrNull()?.text?.length) {
-        if (messages.lastOrNull()?.isStreaming == true) listState.scrollToItem(messages.lastIndex)
+    LaunchedEffect(messages.lastOrNull()?.text?.length, messages.lastOrNull()?.imageId) {
+        val last = messages.lastOrNull() ?: return@LaunchedEffect
+        if (last.isStreaming || last.imageId != null) listState.scrollToItem(messages.lastIndex)
     }
 
     Scaffold(
@@ -198,6 +213,9 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenImageStudio) {
+                        Icon(Icons.Outlined.Palette, contentDescription = "Create an image")
+                    }
                     IconButton(onClick = onOpenHistory) {
                         Icon(Icons.Default.History, contentDescription = "Chat history")
                     }
@@ -224,7 +242,8 @@ fun ChatScreen(
                         persona = persona,
                         userName = userName,
                         modelState = modelState,
-                        onStarter = { if (isReady) onSend(it) else input = it },
+                        needsChatModel = !imageMode,
+                        onStarter = { if (canSend) onSend(it) else input = it },
                         onPickModel = onPickModel,
                         onOpenModelCenter = onOpenModelCenter
                     )
@@ -235,23 +254,52 @@ fun ChatScreen(
                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        items(messages, key = { it.id }) { message ->
-                            MessageBubble(message, persona, onRemember = onRememberMessage)
+                        itemsIndexed(
+                            messages,
+                            key = { _, message -> message.id },
+                            // Lets the list reuse the right layout for each kind of row while scrolling.
+                            contentType = { _, message ->
+                                when {
+                                    message.isImage -> "image"
+                                    message.isUser -> "user"
+                                    else -> "assistant"
+                                }
+                            }
+                        ) { index, message ->
+                            if (message.isImage) {
+                                val request = messages.getOrNull(index - 1)?.takeIf { it.isUser }?.text
+                                ImageMessageBubble(message, request, persona, images)
+                            } else {
+                                MessageBubble(message, persona, onRemember = onRememberMessage)
+                            }
                         }
                     }
                 }
             }
 
-            if (!isReady && messages.isNotEmpty()) {
+            if (!imageMode && !isReady && messages.isNotEmpty()) {
                 ModelBanner(modelState, onPickModel)
             }
 
+            ModeSwitch(
+                mode = chatMode,
+                enabled = !isGenerating,
+                hasImageModel = hasImageModel,
+                onChange = onChatModeChange,
+                onGetImageModel = onGetImageModel
+            )
             InputBar(
                 value = input,
                 onValueChange = { input = it },
-                enabled = isReady,
+                enabled = canSend,
                 isGenerating = isGenerating,
-                placeholder = if (isReady) "Message ${persona.name}…" else "Load a model to start chatting",
+                imageMode = imageMode,
+                placeholder = when {
+                    imageMode && hasImageModel -> "Describe an image to create…"
+                    imageMode -> "Get an image model to create images"
+                    isReady -> "Message ${persona.name}…"
+                    else -> "Load a model to start chatting"
+                },
                 onSend = {
                     onSend(input)
                     input = ""
@@ -309,6 +357,7 @@ private fun EmptyState(
     persona: Persona,
     userName: String,
     modelState: ModelState,
+    needsChatModel: Boolean,
     onStarter: (String) -> Unit,
     onPickModel: () -> Unit,
     onOpenModelCenter: () -> Unit
@@ -337,7 +386,7 @@ private fun EmptyState(
         )
         Spacer(Modifier.height(24.dp))
 
-        if (modelState !is ModelState.Ready) {
+        if (needsChatModel && modelState !is ModelState.Ready) {
             ModelSetupCard(modelState, onPickModel, onOpenModelCenter)
             Spacer(Modifier.height(24.dp))
         }
@@ -387,22 +436,22 @@ private fun ModelSetupCard(modelState: ModelState, onPickModel: () -> Unit, onOp
                     Spacer(Modifier.height(4.dp))
                     Text(
                         if (modelState is ModelState.Error) modelState.message
-                        else "TinyAI runs entirely on your phone. Download a model once (around 1 GB), then choose the file here.",
+                        else "TinyAI runs entirely on your phone. Download a model once (around 1 GB) and it's ready offline.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = if (modelState is ModelState.Error) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(16.dp))
-                    FilledTonalButton(onClick = onPickModel, modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Choose model file")
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(onClick = onOpenModelCenter, modifier = Modifier.fillMaxWidth()) {
+                    FilledTonalButton(onClick = onOpenModelCenter, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("Get a model")
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onPickModel, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Choose a .gguf file")
                     }
                 }
             }
@@ -554,6 +603,7 @@ private fun InputBar(
     onValueChange: (String) -> Unit,
     enabled: Boolean,
     isGenerating: Boolean,
+    imageMode: Boolean,
     placeholder: String,
     onSend: () -> Unit,
     onStop: () -> Unit
@@ -589,17 +639,30 @@ private fun InputBar(
             Spacer(Modifier.width(8.dp))
             val canSend = enabled && value.isNotBlank() && !isGenerating
             val active = isGenerating || canSend
+            val activeBrush = if (imageMode) {
+                Brush.linearGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary))
+            } else {
+                SolidColor(MaterialTheme.colorScheme.primary)
+            }
             Box(
                 Modifier
                     .size(52.dp)
                     .clip(CircleShape)
-                    .background(if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .background(if (active) activeBrush else SolidColor(MaterialTheme.colorScheme.surfaceContainerHigh))
                     .clickable(enabled = active) { if (isGenerating) onStop() else onSend() },
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    if (isGenerating) Icons.Default.Stop else Icons.AutoMirrored.Filled.Send,
-                    contentDescription = if (isGenerating) "Stop" else "Send",
+                    when {
+                        isGenerating -> Icons.Default.Stop
+                        imageMode -> Icons.Default.AutoAwesome
+                        else -> Icons.AutoMirrored.Filled.Send
+                    },
+                    contentDescription = when {
+                        isGenerating -> "Stop"
+                        imageMode -> "Create image"
+                        else -> "Send"
+                    },
                     tint = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }

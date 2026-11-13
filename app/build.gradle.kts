@@ -33,8 +33,8 @@ android {
         minSdk = 24
         targetSdk = 36
         // CI passes -PversionCode=<run number> so every Play upload gets a unique, increasing code.
-        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
-        versionName = "1.0.1"
+        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 3
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -79,6 +79,10 @@ dependencies {
     
     // Native C++ engine wrapper
     implementation(libs.llamacpp.kotlin)
+
+    // On-device image generation (Stable Diffusion ONNX models) and model-folder import
+    implementation(libs.onnxruntime.android)
+    implementation(libs.androidx.documentfile)
 
     // Local persistence (chat history + user memory, two separate databases)
     implementation(libs.androidx.room.runtime)

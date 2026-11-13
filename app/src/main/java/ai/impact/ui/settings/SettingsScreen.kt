@@ -20,6 +20,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -79,9 +83,13 @@ fun SettingsScreen(
     onThemeModeChange: (ThemeMode) -> Unit,
     onOpenPersonas: () -> Unit,
     onCreatePersona: () -> Unit,
-    onPickModel: () -> Unit,
     onUnloadModel: () -> Unit,
-    onOpenModelCenter: () -> Unit,
+    onOpenChatModels: () -> Unit,
+    imageModelTitle: String,
+    imageModelSummary: String,
+    onOpenImageStudio: () -> Unit,
+    onOpenImageModels: () -> Unit,
+    onOpenImageGallery: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenMemory: () -> Unit,
     conversationCount: Int,
@@ -202,24 +210,31 @@ fun SettingsScreen(
                 }
             }
 
-            item { SectionHeader("AI model", Modifier.padding(top = 12.dp)) }
+            item { SectionHeader("Models", Modifier.padding(top = 12.dp)) }
             item {
                 SettingsGroup {
-                    val (modelTitle, modelSubtitle) = when (modelState) {
-                        is ModelState.Ready -> modelState.name to "Loaded and running on-device"
-                        is ModelState.Loading -> modelState.name to "Loading…"
-                        is ModelState.Error -> "Model error" to modelState.message
-                        ModelState.NotLoaded -> "No model loaded" to "Choose a .gguf file to start chatting"
+                    val (chatTitle, chatSubtitle) = when (modelState) {
+                        is ModelState.Ready -> modelState.name to "Chat model · loaded"
+                        is ModelState.Loading -> modelState.name to "Chat model · loading…"
+                        is ModelState.Error -> "Chat model" to modelState.message
+                        ModelState.NotLoaded -> "Chat model" to "Not loaded · download or choose one"
                     }
-                    SettingsRow(Icons.Default.Memory, modelTitle, modelSubtitle, showChevron = false)
+                    SettingsRow(Icons.Outlined.ChatBubbleOutline, chatTitle, chatSubtitle, onClick = onOpenChatModels)
                     Divider()
-                    SettingsRow(Icons.Default.FolderOpen, "Choose model file", "Load a .gguf model from your device", onClick = onPickModel)
-                    Divider()
-                    SettingsRow(Icons.Default.CloudDownload, "Model center", "Download recommended models", onClick = onOpenModelCenter)
+                    SettingsRow(Icons.Outlined.Image, imageModelTitle, imageModelSummary, onClick = onOpenImageModels)
                     if (modelState is ModelState.Ready) {
                         Divider()
-                        SettingsRow(Icons.Default.Eject, "Unload model", "Free up memory", onClick = onUnloadModel)
+                        SettingsRow(Icons.Default.Eject, "Unload chat model", "Free up memory", onClick = onUnloadModel)
                     }
+                }
+            }
+
+            item { SectionHeader("Images", Modifier.padding(top = 12.dp)) }
+            item {
+                SettingsGroup {
+                    SettingsRow(Icons.Outlined.Palette, "Create an image", "Turn a description into a picture, on-device", onClick = onOpenImageStudio)
+                    Divider()
+                    SettingsRow(Icons.Outlined.PhotoLibrary, "Your images", "Everything you've created", onClick = onOpenImageGallery)
                 }
             }
 
@@ -251,7 +266,7 @@ fun SettingsScreen(
                     Divider()
                     SettingsRow(Icons.Default.Info, "Version", appVersion, showChevron = false)
                     Divider()
-                    SettingsRow(Icons.Default.DeleteSweep, "Reset app", "Delete settings, personalities, history and memory", onClick = { confirmReset = true }, destructive = true)
+                    SettingsRow(Icons.Default.DeleteSweep, "Reset app", "Delete settings, personalities, history, memory and images", onClick = { confirmReset = true }, destructive = true)
                 }
             }
             item { Spacer(Modifier.height(32.dp)) }

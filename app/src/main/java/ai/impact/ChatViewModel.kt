@@ -15,11 +15,17 @@ import ai.impact.data.memory.MemoryCategory
 import ai.impact.data.memory.MemoryEntity
 import ai.impact.data.memory.MemoryRepository
 import ai.impact.data.memory.MemorySource
+import ai.impact.image.PromptEnhancement
+import ai.impact.models.CatalogTextModel
+import ai.impact.models.toDownloadSpec
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import org.nehuatl.llamacpp.LlamaHelper
+import java.io.File
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -35,6 +41,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.cancellation.CancellationException
 
 data class ChatMessage(
     val id: Long,
@@ -44,13 +52,31 @@ data class ChatMessage(
     val isError: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
     /** How long the model spent in its <think> block, once that block has closed. */
-    val thinkingMillis: Long? = null
-)
+    val thinkingMillis: Long? = null,
+    /** Gallery id of an image the assistant made for this message. */
+    val imageId: String? = null,
+    val imageWidth: Int? = null,
+    val imageHeight: Int? = null,
+    /** Live progress while that image is being painted. */
+    val imageProgress: GenerationState.Running? = null
+) {
+    val isImage: Boolean get() = imageId != null || imageProgress != null
+}
+
+/** What sending a message in the chat produces. */
+enum class ChatMode { Text, Image }
+
+/** Paints images for the chat; implemented by the image studio's engine. */
+interface ChatImageGenerator {
+    /** Whether any image model is installed (it's loaded on demand). */
+    val hasModel: Boolean
+    suspend fun generate(prompt: String, onState: (GenerationState.Running) -> Unit): GenerationState.Done
+}
 
 sealed interface ModelState {
     data object NotLoaded : ModelState
-    data class Loading(val name: String) : ModelState
-    data class Ready(val name: String) : ModelState
+    data class Loading(val name: String, val uri: String? = null) : ModelState
+    data class Ready(val name: String, val uri: String? = null) : ModelState
     data class Error(val message: String) : ModelState
 }
 
@@ -77,6 +103,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val history = app.chatHistory
     private val memory = app.memory
     private val memoryExtractor = app.memoryExtractor
+    private val textModels = app.textModels
+
+    /** Downloaded chat models and in-progress downloads, for the Models screen. */
+    val installedTextModels = textModels.installed
+    val textDownloads = textModels.downloads
+
+    private val _chatMode = MutableStateFlow(ChatMode.entries.getOrNull(preferences.chatMode) ?: ChatMode.Text)
+    val chatMode: StateFlow<ChatMode> = _chatMode.asStateFlow()
+
+    /** Set by the activity: makes images when the chat is in image mode. */
+    var imageGenerator: ChatImageGenerator? = null
+    private var imageJob: Job? = null
 
     /** All saved conversations, newest first, for the history screen. */
     val conversations = history.conversations
@@ -129,6 +167,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _llmFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(extraBufferCapacity = 256)
 
+    /** A single prompt run outside any chat (e.g. enhancing an image prompt); its tokens never reach the chat. */
+    private class OneShot(val maxChars: Int) {
+        val text = StringBuilder()
+        val result = CompletableDeferred<String>()
+    }
+
+    @Volatile
+    private var oneShot: OneShot? = null
+
     // Background scope for LlamaHelper so native work never blocks the UI thread.
     // The handler keeps engine failures that aren't Exceptions (e.g. UnsatisfiedLinkError) from crashing the app.
     private val backgroundScope = CoroutineScope(
@@ -173,6 +220,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             onModelLoadFailed("Couldn't load \"${loading.name}\". The file may be incomplete or not a supported model.")
             return
         }
+        oneShot?.let { shot ->
+            handleOneShot(shot, event)
+            return
+        }
         val session = generating ?: return
         when (event) {
             is LlamaHelper.LLMEvent.Ongoing -> {
@@ -210,6 +261,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun handleOneShot(shot: OneShot, event: LlamaHelper.LLMEvent) {
+        when (event) {
+            is LlamaHelper.LLMEvent.Ongoing -> {
+                shot.text.append(event.word)
+                val text = shot.text.toString()
+                val marker = STOP_MARKERS.map { text.indexOf(it) }.filter { it >= 0 }.minOrNull()
+                if (marker != null || text.length >= shot.maxChars) {
+                    runCatching { llamaHelper.stopPrediction() }
+                    shot.result.complete(if (marker != null) text.substring(0, marker) else text)
+                }
+            }
+            is LlamaHelper.LLMEvent.Done -> shot.result.complete(shot.text.toString())
+            is LlamaHelper.LLMEvent.Error -> {
+                Log.w(TAG, "One-shot prompt failed: ${event.message}")
+                shot.result.complete("")
+            }
+            else -> Unit
+        }
+    }
+
     private fun finishGeneration(session: Session) {
         if (generating !== session) return
         var reply: ChatMessage? = null
@@ -243,10 +314,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         val saved = preferences.modelUri ?: return
         val uri = Uri.parse(saved)
-        val hasPermission = getApplication<Application>().contentResolver.persistedUriPermissions
-            .any { it.uri == uri && it.isReadPermission }
-        if (hasPermission) {
-            loadModel(uri, persist = false)
+        // Downloaded models are plain files; picked ones need their read permission to have survived.
+        val usable = if (uri.scheme == "file") {
+            File(uri.path.orEmpty()).isFile
+        } else {
+            getApplication<Application>().contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+        }
+        if (usable) {
+            loadModel(uri, persist = false, label = preferences.modelName)
         } else {
             preferences.setModel(null, null)
         }
@@ -263,9 +338,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         loadModel(uri, persist = true)
     }
 
-    private fun loadModel(uri: Uri, persist: Boolean) {
-        val name = displayName(uri)
-        val lower = name.lowercase()
+    /** Loads a downloaded chat model from the Models screen. */
+    fun loadTextModel(id: String) {
+        val model = textModels.find(id) ?: return
+        loadModel(Uri.fromFile(model.file), persist = true, label = model.name)
+    }
+
+    fun deleteTextModel(id: String) {
+        val model = textModels.find(id)
+        if (model != null && currentModelUri() == Uri.fromFile(model.file).toString()) unloadModel()
+        viewModelScope.launch(Dispatchers.IO) { textModels.delete(id) }
+    }
+
+    /** Returns an error to show, or null once queued. */
+    fun startTextDownload(model: CatalogTextModel): String? = textModels.startDownload(model.toDownloadSpec())
+
+    fun cancelTextDownload(id: String) = textModels.cancelDownload(id)
+
+    fun dismissTextDownloadError(id: String) = textModels.dismissDownloadError(id)
+
+    private fun currentModelUri(): String? = when (val state = _modelState.value) {
+        is ModelState.Ready -> state.uri
+        is ModelState.Loading -> state.uri
+        else -> null
+    }
+
+    private fun loadModel(uri: Uri, persist: Boolean, label: String? = null) {
+        val fileName = displayName(uri)
+        // The file name says which chat template the model expects; the label is just for display.
+        val name = label?.takeIf { it.isNotBlank() } ?: fileName
+        val lower = fileName.lowercase()
         promptFormat = when {
             "llama" in lower -> PromptFormat.Llama3
             "gemma" in lower -> PromptFormat.Gemma
@@ -274,7 +376,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         Log.d(TAG, "Loading $name with format $promptFormat")
 
         if (!lower.endsWith(".gguf")) {
-            _modelState.value = ModelState.Error("\"$name\" isn't a .gguf model file. Please pick a GGUF model.")
+            _modelState.value = ModelState.Error("\"$fileName\" isn't a .gguf model file. Please pick a GGUF model.")
             return
         }
 
@@ -284,7 +386,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         stopGeneration()
-        _modelState.value = ModelState.Loading(name)
+        _modelState.value = ModelState.Loading(name, uri.toString())
 
         viewModelScope.launch(Dispatchers.IO) {
             // Only a first-time load is marked: a model that has loaded before is known to fit.
@@ -304,7 +406,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         preferences.setModelLoading(null)
                         // Saved only once it works, so a model that crashes the app is never auto-loaded at launch.
                         if (persist) preferences.setModel(uri.toString(), name)
-                        _modelState.value = ModelState.Ready(name)
+                        _modelState.value = ModelState.Ready(name, uri.toString())
                     }
                 )
             } catch (e: Exception) {
@@ -362,9 +464,78 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // region Chat
 
+    fun setChatMode(mode: ChatMode) {
+        _chatMode.value = mode
+        preferences.setChatMode(mode.ordinal)
+    }
+
+    /** Sends [userText] as a chat message or an image request, depending on the mode. */
+    fun send(userText: String) {
+        if (_chatMode.value == ChatMode.Image) requestImage(userText) else sendMessage(userText)
+    }
+
+    private fun requestImage(userText: String) {
+        val text = userText.trim()
+        val generator = imageGenerator
+        if (text.isEmpty() || _isGenerating.value || generator == null) return
+
+        val session = active
+        val userMessage = newMessage(text, isUser = true)
+        val placeholder = newMessage("", isUser = false, isStreaming = true)
+        updateSession(session) { it + userMessage + placeholder }
+        generating = session
+        _isGenerating.value = true
+        persist {
+            val id = session.dbId ?: history.createConversation(session.personaId, text).also { newId ->
+                session.dbId = newId
+                if (session === active) _activeConversationId.value = newId
+            }
+            history.addMessage(id, StoredMessage(true, text, userMessage.createdAt, null))
+        }
+
+        fun replacePlaceholder(transform: (ChatMessage) -> ChatMessage?) = updateSession(session) { current ->
+            current.mapNotNull { if (it.id == placeholder.id) transform(it) else it }
+        }
+
+        imageJob = viewModelScope.launch {
+            try {
+                val done = generator.generate(text) { running ->
+                    replacePlaceholder { it.copy(imageProgress = running) }
+                }
+                val image = done.image
+                // The caption is the enhanced prompt, when the text model rewrote it.
+                val caption = image.enhancedPrompt.orEmpty()
+                replacePlaceholder {
+                    it.copy(
+                        text = caption, isStreaming = false, imageProgress = null,
+                        imageId = image.id, imageWidth = image.width, imageHeight = image.height
+                    )
+                }
+                persist {
+                    val id = session.dbId ?: return@persist
+                    history.addMessage(
+                        id,
+                        StoredMessage(false, caption.ifEmpty { text }, placeholder.createdAt, null, image.id, image.width, image.height)
+                    )
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                replacePlaceholder { null }
+            } catch (e: Exception) {
+                Log.w(TAG, "Chat image failed", e)
+                replacePlaceholder {
+                    newMessage(e.message ?: "Couldn't create the image.", isUser = false, isError = true)
+                }
+            } finally {
+                if (generating === session) generating = null
+                imageJob = null
+                _isGenerating.value = false
+            }
+        }
+    }
+
     fun sendMessage(userText: String) {
         val text = userText.trim()
-        if (text.isEmpty() || _modelState.value !is ModelState.Ready || _isGenerating.value) return
+        if (text.isEmpty() || _modelState.value !is ModelState.Ready || _isGenerating.value || oneShot != null) return
 
         val session = active
         val userMessage = newMessage(text, isUser = true)
@@ -395,6 +566,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopGeneration() {
+        imageJob?.let {
+            it.cancel()
+            return
+        }
         val session = generating ?: return
         try {
             llamaHelper.stopPrediction()
@@ -483,8 +658,50 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun toChatMessage(stored: StoredMessage) =
-        ChatMessage(nextMessageId++, stored.text, stored.isUser, createdAt = stored.createdAt, thinkingMillis = stored.thinkingMillis)
+    private fun toChatMessage(stored: StoredMessage) = ChatMessage(
+        nextMessageId++,
+        stored.text,
+        stored.isUser,
+        createdAt = stored.createdAt,
+        thinkingMillis = stored.thinkingMillis,
+        imageId = stored.imageId,
+        imageWidth = stored.imageWidth,
+        imageHeight = stored.imageHeight
+    )
+
+    // endregion
+
+    // region One-shot prompts
+
+    /**
+     * Runs one system + user prompt through the loaded model, outside any conversation. Returns
+     * null if no model is loaded or it's busy answering a chat, so callers can carry on without it.
+     */
+    suspend fun completeOnce(system: String, user: String, maxChars: Int = 2_000): String? {
+        val chatStreaming = _isGenerating.value && imageJob == null
+        if (_modelState.value !is ModelState.Ready || chatStreaming || oneShot != null) return null
+        val shot = OneShot(maxChars)
+        oneShot = shot
+        try {
+            withContext(Dispatchers.IO) { llamaHelper.predict(chatTemplate(system, listOf(true to user))) }
+            return shot.result.await()
+        } catch (e: CancellationException) {
+            runCatching { llamaHelper.stopPrediction() }
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "One-shot prompt failed", e)
+            runCatching { llamaHelper.stopPrediction() }
+            return null
+        } finally {
+            oneShot = null
+        }
+    }
+
+    /** Turns a short idea into a detailed Stable Diffusion prompt, or null if the chat model can't. */
+    suspend fun enhanceImagePrompt(idea: String, styleHint: String): String? {
+        val raw = completeOnce(PromptEnhancement.systemPrompt(styleHint), idea) ?: return null
+        return PromptEnhancement.clean(raw)
+    }
 
     // endregion
 
@@ -555,8 +772,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val turns = ArrayDeque<ChatMessage>()
         var used = 0
+        // Image requests and the images they produced aren't conversation the text model can follow.
+        val imageTurns = history.indices.filter { i ->
+            history[i].isImage || (history[i].isUser && history.getOrNull(i + 1)?.isImage == true)
+        }.map { history[it].id }.toSet()
         for (message in history.asReversed()) {
-            if (message.isError || message.text.isBlank()) continue
+            if (message.isError || message.text.isBlank() || message.id in imageTurns) continue
             // Feed back only the visible answer; the model's reasoning would just eat the context window.
             val text = if (message.isUser) message.text else ResponseParser.parse(message.text).answer
             if (text.isBlank()) continue
@@ -567,28 +788,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Templates expect the conversation to start with a user turn.
         while (turns.isNotEmpty() && !turns.first().isUser) turns.removeFirst()
 
+        return chatTemplate(system, turns.map { it.isUser to it.text })
+    }
+
+    /** Formats a system prompt and alternating turns (isUser to text) in the loaded model's chat template. */
+    private fun chatTemplate(system: String, turns: List<Pair<Boolean, String>>): String {
         return when (promptFormat) {
             PromptFormat.Llama3 -> buildString {
                 append("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n$system<|eot_id|>")
-                turns.forEach {
-                    val role = if (it.isUser) "user" else "assistant"
-                    append("<|start_header_id|>$role<|end_header_id|>\n\n${it.text}<|eot_id|>")
+                turns.forEach { (isUser, text) ->
+                    val role = if (isUser) "user" else "assistant"
+                    append("<|start_header_id|>$role<|end_header_id|>\n\n$text<|eot_id|>")
                 }
                 append("<|start_header_id|>assistant<|end_header_id|>\n\n")
             }
             PromptFormat.Gemma -> buildString {
-                turns.forEachIndexed { index, it ->
-                    val role = if (it.isUser) "user" else "model"
-                    val body = if (index == 0) "$system\n\n${it.text}" else it.text
+                turns.forEachIndexed { index, (isUser, text) ->
+                    val role = if (isUser) "user" else "model"
+                    val body = if (index == 0) "$system\n\n$text" else text
                     append("<start_of_turn>$role\n$body<end_of_turn>\n")
                 }
                 append("<start_of_turn>model\n")
             }
             PromptFormat.ChatML -> buildString {
                 append("<|im_start|>system\n$system<|im_end|>\n")
-                turns.forEach {
-                    val role = if (it.isUser) "user" else "assistant"
-                    append("<|im_start|>$role\n${it.text}<|im_end|>\n")
+                turns.forEach { (isUser, text) ->
+                    val role = if (isUser) "user" else "assistant"
+                    append("<|im_start|>$role\n$text<|im_end|>\n")
                 }
                 append("<|im_start|>assistant\n")
             }

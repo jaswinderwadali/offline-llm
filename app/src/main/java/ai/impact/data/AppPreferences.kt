@@ -29,6 +29,7 @@ class AppPreferences(context: Context) {
         private const val KEY_THEME = "theme_mode"
         private const val KEY_USE_MEMORY = "use_memory"
         private const val KEY_AUTO_MEMORY = "auto_memory"
+        private const val KEY_CHAT_MODE = "chat_mode"
     }
 
     private val appContext = context.applicationContext
@@ -63,6 +64,13 @@ class AppPreferences(context: Context) {
     private val _autoMemory = MutableStateFlow(prefs.getBoolean(KEY_AUTO_MEMORY, true))
     /** Whether new memories are learned automatically from what the user writes. */
     val autoMemory: StateFlow<Boolean> = _autoMemory.asStateFlow()
+
+    /** Whether the chat makes text or images (a ChatMode ordinal). */
+    val chatMode: Int get() = prefs.getInt(KEY_CHAT_MODE, 0)
+
+    fun setChatMode(mode: Int) {
+        prefs.edit().putInt(KEY_CHAT_MODE, mode).apply()
+    }
 
     val modelUri: String? get() = prefs.getString(KEY_MODEL_URI, null)
     val modelName: String? get() = prefs.getString(KEY_MODEL_NAME, null)

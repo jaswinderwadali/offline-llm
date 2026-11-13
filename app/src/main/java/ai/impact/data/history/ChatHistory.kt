@@ -4,16 +4,29 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 /** Stores conversations and their messages. Independent from the user-memory database. */
-@Database(entities = [ConversationEntity::class, MessageEntity::class], version = 1, exportSchema = true)
+@Database(entities = [ConversationEntity::class, MessageEntity::class], version = 2, exportSchema = true)
 abstract class ChatHistoryDatabase : RoomDatabase() {
     abstract fun dao(): ChatHistoryDao
 
     companion object {
+        /** Version 2 lets assistant messages carry a generated image. */
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN imageId TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN imageWidth INTEGER")
+                db.execSQL("ALTER TABLE messages ADD COLUMN imageHeight INTEGER")
+            }
+        }
+
         fun create(context: Context): ChatHistoryDatabase =
-            Room.databaseBuilder(context.applicationContext, ChatHistoryDatabase::class.java, "chat_history.db").build()
+            Room.databaseBuilder(context.applicationContext, ChatHistoryDatabase::class.java, "chat_history.db")
+                .addMigrations(MIGRATION_1_2)
+                .build()
     }
 }
 
@@ -22,7 +35,10 @@ data class StoredMessage(
     val isUser: Boolean,
     val text: String,
     val createdAt: Long,
-    val thinkingMillis: Long?
+    val thinkingMillis: Long?,
+    val imageId: String? = null,
+    val imageWidth: Int? = null,
+    val imageHeight: Int? = null
 )
 
 class ChatHistoryRepository(private val dao: ChatHistoryDao) {
@@ -43,7 +59,10 @@ class ChatHistoryRepository(private val dao: ChatHistoryDao) {
                 isUser = message.isUser,
                 text = message.text,
                 createdAt = message.createdAt,
-                thinkingMillis = message.thinkingMillis
+                thinkingMillis = message.thinkingMillis,
+                imageId = message.imageId,
+                imageWidth = message.imageWidth,
+                imageHeight = message.imageHeight
             )
         )
         dao.touch(conversationId, System.currentTimeMillis())
@@ -54,7 +73,9 @@ class ChatHistoryRepository(private val dao: ChatHistoryDao) {
     suspend fun latestConversation(personaId: String): ConversationEntity? = dao.latestForPersona(personaId)
 
     suspend fun messages(conversationId: Long): List<StoredMessage> =
-        dao.getMessages(conversationId).map { StoredMessage(it.isUser, it.text, it.createdAt, it.thinkingMillis) }
+        dao.getMessages(conversationId).map {
+            StoredMessage(it.isUser, it.text, it.createdAt, it.thinkingMillis, it.imageId, it.imageWidth, it.imageHeight)
+        }
 
     suspend fun delete(conversationId: Long) = dao.deleteConversation(conversationId)
 

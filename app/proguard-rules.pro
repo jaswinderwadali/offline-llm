@@ -22,3 +22,6 @@
 # llama.cpp JNI bindings: native code calls back into these classes by name.
 -keep class org.nehuatl.llamacpp.** { *; }
 -keepclasseswithmembernames class * { native <methods>; }
+
+# ONNX Runtime JNI: native code looks these classes up by name.
+-keep class ai.onnxruntime.** { *; }
