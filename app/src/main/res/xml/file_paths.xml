@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <files-path name="generated" path="generated/" />
+    <!-- QR codes made by the chat's skill, written just before they're shared. -->
+    <cache-path name="shared" path="shared/" />
 </paths>

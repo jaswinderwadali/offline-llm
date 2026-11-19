@@ -84,6 +84,9 @@ dependencies {
     implementation(libs.onnxruntime.android)
     implementation(libs.androidx.documentfile)
 
+    // QR codes for the chat's "Generate QR code" skill
+    implementation(libs.zxing.core)
+
     // Local persistence (chat history + user memory, two separate databases)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
@@ -94,6 +97,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.0")
 
     testImplementation(libs.junit)
+    // The real org.json, so parsing code can be unit tested off-device (Android only ships stubs to tests).
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

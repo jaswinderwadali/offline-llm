@@ -2,6 +2,16 @@ package ai.impact.ui.settings
 
 import ai.impact.ModelState
 import ai.impact.data.Persona
+import ai.impact.data.ReplyLength
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.material.icons.automirrored.filled.ShortText
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import ai.impact.data.ThemeMode
 import ai.impact.ui.components.PersonaAvatar
 import ai.impact.ui.components.SectionHeader
@@ -79,7 +89,7 @@ fun SettingsScreen(
     appVersion: String,
     onBack: () -> Unit,
     onUserNameChange: (String) -> Unit,
-    onWordLimitChange: (Int) -> Unit,
+    onReplyLengthChange: (ReplyLength) -> Unit,
     onThemeModeChange: (ThemeMode) -> Unit,
     onOpenPersonas: () -> Unit,
     onCreatePersona: () -> Unit,
@@ -100,7 +110,6 @@ fun SettingsScreen(
     var editingName by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
     var confirmReset by remember { mutableStateOf(false) }
-    var sliderValue by remember(wordLimit) { mutableFloatStateOf(wordLimit.toFloat()) }
 
     Scaffold(
         topBar = {
@@ -185,28 +194,10 @@ fun SettingsScreen(
             item { SectionHeader("Responses", Modifier.padding(top = 12.dp)) }
             item {
                 SettingsGroup {
-                    Column(Modifier.padding(16.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Reply length", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                            Text(
-                                "${sliderValue.toInt()} words",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        Slider(
-                            value = sliderValue,
-                            onValueChange = { sliderValue = it },
-                            onValueChangeFinished = { onWordLimitChange(sliderValue.toInt()) },
-                            valueRange = 50f..500f,
-                            steps = 8
-                        )
-                        Text(
-                            "Shorter replies are faster on most phones.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+                    ReplyLengthPicker(
+                        selected = ReplyLength.nearest(wordLimit),
+                        onSelect = onReplyLengthChange
+                    )
                 }
             }
 
@@ -318,6 +309,100 @@ fun SettingsScreen(
                 }
             },
             dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Cancel") } }
+        )
+    }
+}
+
+/**
+ * Five named lengths instead of a free slider: each tile previews its length as lines of text,
+ * and a tap saves immediately.
+ */
+@Composable
+private fun ReplyLengthPicker(selected: ReplyLength, onSelect: (ReplyLength) -> Unit) {
+    Column(Modifier.padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.AutoMirrored.Filled.ShortText,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.width(16.dp))
+            Text("Reply length", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+            Text(
+                "Up to ${selected.words} words",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.selectableGroup()) {
+            ReplyLength.entries.forEach { length ->
+                ReplyLengthTile(
+                    length = length,
+                    selected = length == selected,
+                    onClick = { onSelect(length) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "${selected.description} Takes effect from your next message.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun ReplyLengthTile(length: ReplyLength, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val accent = MaterialTheme.colorScheme.primary
+    val border by animateColorAsState(
+        if (selected) accent else MaterialTheme.colorScheme.outlineVariant,
+        label = "tileBorder"
+    )
+    val background by animateColorAsState(
+        if (selected) accent.copy(alpha = 0.10f) else Color.Transparent,
+        label = "tileBackground"
+    )
+    Column(
+        modifier
+            .clip(RoundedCornerShape(14.dp))
+            .border(if (selected) 2.dp else 1.dp, border, RoundedCornerShape(14.dp))
+            .background(background)
+            .selectable(selected = selected, onClick = onClick, role = Role.RadioButton)
+            .padding(vertical = 10.dp, horizontal = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // A tiny paragraph whose line count grows with the length.
+        val lines = length.ordinal + 1
+        Column(
+            Modifier.height(30.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp, Alignment.CenterVertically)
+        ) {
+            repeat(lines) { line ->
+                val last = line == lines - 1
+                Box(
+                    Modifier
+                        .width(if (last && lines > 1) 16.dp else 26.dp)
+                        .height(3.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f))
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            length.label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) accent else MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            "${length.words}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }

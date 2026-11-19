@@ -4,6 +4,7 @@ import android.app.UiModeManager
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import ai.impact.data.skills.BuiltInSkills
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,6 +31,10 @@ class AppPreferences(context: Context) {
         private const val KEY_USE_MEMORY = "use_memory"
         private const val KEY_AUTO_MEMORY = "auto_memory"
         private const val KEY_CHAT_MODE = "chat_mode"
+        private const val KEY_ENABLED_SKILLS = "enabled_skills"
+        private const val KEY_AUTO_SKILLS = "auto_skills"
+        /** Every skill the app has offered so far, so a skill added in an update can start enabled. */
+        private const val KEY_KNOWN_SKILLS = "known_skills"
     }
 
     private val appContext = context.applicationContext
@@ -49,7 +54,11 @@ class AppPreferences(context: Context) {
     private val _customPersonas = MutableStateFlow(readCustomPersonas())
     val customPersonas: StateFlow<List<Persona>> = _customPersonas.asStateFlow()
 
-    private val _wordLimit = MutableStateFlow(prefs.getInt(KEY_WORD_LIMIT, 150))
+    // Snapped to a preset, so values saved by the old free slider (e.g. 149 or 350) still map cleanly.
+    private val _wordLimit = MutableStateFlow(
+        ReplyLength.nearest(prefs.getInt(KEY_WORD_LIMIT, ReplyLength.Default.words)).words
+    )
+    /** Most words a reply may have; one of the [ReplyLength] presets. */
     val wordLimit: StateFlow<Int> = _wordLimit.asStateFlow()
 
     private val _themeMode = MutableStateFlow(
@@ -64,6 +73,46 @@ class AppPreferences(context: Context) {
     private val _autoMemory = MutableStateFlow(prefs.getBoolean(KEY_AUTO_MEMORY, true))
     /** Whether new memories are learned automatically from what the user writes. */
     val autoMemory: StateFlow<Boolean> = _autoMemory.asStateFlow()
+
+    private val _enabledSkillIds = MutableStateFlow(readEnabledSkills())
+    /** Skills the user turned on, so they're one tap away in the chat's input field. */
+    val enabledSkillIds: StateFlow<Set<String>> = _enabledSkillIds.asStateFlow()
+
+    fun setSkillEnabled(id: String, enabled: Boolean) {
+        val updated = if (enabled) _enabledSkillIds.value + id else _enabledSkillIds.value - id
+        prefs.edit().putString(KEY_ENABLED_SKILLS, updated.joinToString(",")).apply()
+        _enabledSkillIds.value = updated
+    }
+
+    private val _autoSkills = MutableStateFlow(prefs.getBoolean(KEY_AUTO_SKILLS, true))
+    /** Whether a message that clearly asks for an enabled skill uses it without the user picking it. */
+    val autoSkills: StateFlow<Boolean> = _autoSkills.asStateFlow()
+
+    fun setAutoSkills(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_SKILLS, enabled).apply()
+        _autoSkills.value = enabled
+    }
+
+    private fun readEnabledSkills(): Set<String> {
+        val allIds = BuiltInSkills.all.map { it.id }.toSet()
+        val raw = prefs.getString(KEY_ENABLED_SKILLS, null)
+        if (raw == null) {
+            prefs.edit().putString(KEY_KNOWN_SKILLS, allIds.joinToString(",")).apply()
+            return BuiltInSkills.defaultEnabledIds
+        }
+        val saved = raw.split(',').filter { it.isNotBlank() }.toSet()
+        // Skills added in an update start in their default state; ones the user has seen keep their choice.
+        // Before this list was kept, everything in the first release's catalog had been seen.
+        val known = prefs.getString(KEY_KNOWN_SKILLS, null)?.split(',')?.toSet() ?: (allIds - "image")
+        val added = BuiltInSkills.defaultEnabledIds - known
+        if (allIds != known) {
+            prefs.edit()
+                .putString(KEY_KNOWN_SKILLS, allIds.joinToString(","))
+                .putString(KEY_ENABLED_SKILLS, (saved + added).joinToString(","))
+                .apply()
+        }
+        return saved + added
+    }
 
     /** Whether the chat makes text or images (a ChatMode ordinal). */
     val chatMode: Int get() = prefs.getInt(KEY_CHAT_MODE, 0)
@@ -90,9 +139,9 @@ class AppPreferences(context: Context) {
         _selectedPersonaId.value = id
     }
 
-    fun setWordLimit(limit: Int) {
-        prefs.edit().putInt(KEY_WORD_LIMIT, limit).apply()
-        _wordLimit.value = limit
+    fun setReplyLength(length: ReplyLength) {
+        prefs.edit().putInt(KEY_WORD_LIMIT, length.words).apply()
+        _wordLimit.value = length.words
     }
 
     fun setThemeMode(mode: ThemeMode) {
@@ -155,11 +204,13 @@ class AppPreferences(context: Context) {
         _userName.value = ""
         _selectedPersonaId.value = BuiltInPersonas.DEFAULT_ID
         _customPersonas.value = emptyList()
-        _wordLimit.value = 150
+        _wordLimit.value = ReplyLength.Default.words
         _themeMode.value = ThemeMode.System
         applySystemNightMode(ThemeMode.System)
         _useMemory.value = true
         _autoMemory.value = true
+        _enabledSkillIds.value = BuiltInSkills.defaultEnabledIds
+        _autoSkills.value = true
     }
 
     private fun writeCustomPersonas(list: List<Persona>) {

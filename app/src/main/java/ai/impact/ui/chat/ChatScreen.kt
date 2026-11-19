@@ -89,6 +89,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -107,6 +108,23 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.SolidColor
 import ai.impact.ChatMode
+import ai.impact.SkillEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import ai.impact.data.skills.BuiltInSkills
+import ai.impact.data.skills.ScheduledNotification
+import ai.impact.data.skills.Skill
+import ai.impact.data.skills.SkillAction
+import ai.impact.data.skills.SkillRouter
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.outlined.Bolt
+import androidx.core.content.ContextCompat
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -117,7 +135,8 @@ fun ChatScreen(
     modelState: ModelState,
     isGenerating: Boolean,
     userName: String,
-    onSend: (String) -> Unit,
+    /** Text, the skill to use (or null for plain chat), and whether that skill was picked automatically. */
+    onSend: (String, Skill?, Boolean) -> Unit,
     onStop: () -> Unit,
     onNewChat: () -> Unit,
     onSelectPersona: (String) -> Unit,
@@ -135,16 +154,117 @@ fun ChatScreen(
     onChatModeChange: (ChatMode) -> Unit,
     hasImageModel: Boolean,
     onGetImageModel: () -> Unit,
-    images: ChatImageActions
+    images: ChatImageActions,
+    enabledSkillIds: Set<String>,
+    onToggleSkill: (String, Boolean) -> Unit,
+    skillEffects: Flow<SkillEffect>,
+    scheduledNotifications: List<ScheduledNotification>,
+    onCancelNotification: (Int) -> Unit,
+    autoSkills: Boolean,
+    onAutoSkillsChange: (Boolean) -> Unit
 ) {
     var input by rememberSaveable { mutableStateOf("") }
-    var showSwitcher by rememberSaveable { mutableStateOf(false) }
+    // The sheet opened from the input field (or the title); null when it's closed.
+    var sheetTab by rememberSaveable { mutableStateOf<ComposerSheetTab?>(null) }
+    var activeSkillId by rememberSaveable { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val isReady = modelState is ModelState.Ready
     val imageMode = chatMode == ChatMode.Image
+    // Skills handle text messages only; image mode keeps its own prompt flow.
+    val activeSkill = BuiltInSkills.byId(activeSkillId).takeUnless { imageMode }
     // Image mode only needs an image model; the chat model is optional (it can polish prompts).
-    val canSend = if (imageMode) hasImageModel else isReady
+    // Tool skills such as QR codes and reminders work with no model at all.
+    val canSend = when {
+        imageMode -> hasImageModel
+        activeSkill != null -> isReady || !activeSkill.needsModel
+        // With automatic skills, typing stays open so "make a QR code for…" works without a model.
+        else -> isReady || (autoSkills && BuiltInSkills.all.any { it.id in enabledSkillIds && !it.needsModel })
+    }
     val snackbarHostState = remember { SnackbarHostState() }
+    val context = LocalContext.current
+
+    // Only while the chat is on screen: Android blocks opening other apps from the background,
+    // so a draft that finishes while the user is away just waits in the chat with its Send button.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    LaunchedEffect(skillEffects, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            skillEffects.collect { effect ->
+            when (effect) {
+                is SkillEffect.AddToCalendar -> context.openCalendar(effect.title, effect.triggerAt)
+                is SkillEffect.SendToApp -> context.sendToApp(effect.target, effect.text, effect.phone)
+            }
+            }
+        }
+    }
+
+    // Notifications need permission on Android 13+; ask the first time the skill is used, then send.
+    var pendingSend by remember { mutableStateOf<Pair<String, Skill>?>(null) }
+    // Event handlers below are cached by Compose, so they read these through State: a plain value
+    // captured at composition would be stale (that once sent every skill message as plain chat).
+    val currentOnSend by rememberUpdatedState(onSend)
+    val currentOnToggleSkill by rememberUpdatedState(onToggleSkill)
+    val currentEnabledSkillIds by rememberUpdatedState(enabledSkillIds)
+    val currentImageMode by rememberUpdatedState(imageMode)
+    val currentAutoSkills by rememberUpdatedState(autoSkills)
+    val currentIsReady by rememberUpdatedState(isReady)
+    val currentHasImageModel by rememberUpdatedState(hasImageModel)
+    val currentOnGetImageModel by rememberUpdatedState(onGetImageModel)
+    val scope = rememberCoroutineScope()
+    var pendingAuto by remember { mutableStateOf(false) }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        pendingSend?.let { (text, skill) -> currentOnSend(text, skill, pendingAuto) }
+        pendingSend = null
+    }
+    fun submit() {
+        val text = input
+        // Read the skill from state at the moment of sending, never from a captured value.
+        val picked = BuiltInSkills.byId(activeSkillId).takeUnless { currentImageMode }
+        // Nothing picked: use an enabled skill if the message clearly asks for one.
+        val detected = if (picked == null && !currentImageMode && currentAutoSkills) {
+            SkillRouter.detect(text, currentEnabledSkillIds)
+        } else null
+        val skill = picked ?: detected
+        if (skill?.action == SkillAction.Image && !currentHasImageModel) {
+            scope.launch {
+                val result = snackbarHostState.showSnackbar(
+                    "Creating images needs an image model on this phone.",
+                    actionLabel = "Get one",
+                    duration = SnackbarDuration.Long
+                )
+                if (result == SnackbarResult.ActionPerformed) currentOnGetImageModel()
+            }
+            return
+        }
+        if (!currentImageMode && !currentIsReady && (skill == null || skill.needsModel)) {
+            // Typing is allowed without a model so skills can still run; plain chat can't.
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    if (skill == null) "No chat model loaded. Load one to chat, or ask for something like a QR code or a reminder."
+                    else "${skill.name} needs a chat model. Load one from Settings."
+                )
+            }
+            return
+        }
+        input = ""
+        activeSkillId = null
+        val auto = detected != null
+        val needsPermission = skill?.action == SkillAction.Notification &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needsPermission) {
+            pendingSend = text to skill!!
+            pendingAuto = auto
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            currentOnSend(text, skill, auto)
+        }
+    }
+    fun useSkill(skill: Skill) {
+        if (skill.id !in currentEnabledSkillIds) currentOnToggleSkill(skill.id, true)
+        activeSkillId = skill.id
+        if (input.startsWith("/")) input = ""
+        sheetTab = null
+    }
 
     LaunchedEffect(memoryEvents) {
         memoryEvents.collect { memory ->
@@ -186,25 +306,18 @@ fun ChatScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .clip(RoundedCornerShape(14.dp))
-                            .clickable { showSwitcher = true }
+                            .clickable(onClickLabel = "Switch personality") { sheetTab = ComposerSheetTab.Personality }
                             .padding(vertical = 4.dp, horizontal = 4.dp)
                     ) {
                         PersonaAvatar(persona, size = 40.dp)
                         Spacer(Modifier.width(12.dp))
                         Column {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    persona.name,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Icon(
-                                    Icons.Default.KeyboardArrowDown,
-                                    contentDescription = "Switch personality",
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
+                            Text(
+                                persona.name,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                             val isThinking = messages.lastOrNull()?.let {
                                 it.isStreaming && ResponseParser.parse(it.text).let { p -> p.hasThinking && !p.isThinkingComplete }
                             } == true
@@ -242,10 +355,12 @@ fun ChatScreen(
                         persona = persona,
                         userName = userName,
                         modelState = modelState,
-                        needsChatModel = !imageMode,
-                        onStarter = { if (canSend) onSend(it) else input = it },
+                        needsChatModel = !imageMode && activeSkill?.needsModel != false,
+                        onStarter = { if (isReady && activeSkill == null) onSend(it, null, false) else input = it },
                         onPickModel = onPickModel,
-                        onOpenModelCenter = onOpenModelCenter
+                        onOpenModelCenter = onOpenModelCenter,
+                        skills = if (imageMode) emptyList() else BuiltInSkills.all.filter { it.id in enabledSkillIds },
+                        onUseSkill = ::useSkill
                     )
                 } else {
                     LazyColumn(
@@ -266,11 +381,20 @@ fun ChatScreen(
                                 }
                             }
                         ) { index, message ->
+                            val toolSkill = message.skill?.takeIf { it.isTool && !message.isUser }
                             if (message.isImage) {
                                 val request = messages.getOrNull(index - 1)?.takeIf { it.isUser }?.text
                                 ImageMessageBubble(message, request, persona, images)
+                            } else if (toolSkill != null) {
+                                SkillReplyCard(message, toolSkill, persona, scheduledNotifications, onCancelNotification)
                             } else {
-                                MessageBubble(message, persona, onRemember = onRememberMessage)
+                                MessageBubble(
+                                    message, persona, onRemember = onRememberMessage,
+                                    // Undo for an automatic pick: send the same words as plain chat.
+                                    onReplyAsChat = if (isReady && !isGenerating) {
+                                        { text -> onSend(text, null, false) }
+                                    } else null
+                                )
                             }
                         }
                     }
@@ -288,44 +412,65 @@ fun ChatScreen(
                 onChange = onChatModeChange,
                 onGetImageModel = onGetImageModel
             )
+            // Typing "/" first lists skills to pick by name.
+            val slashMatches = if (!imageMode && activeSkill == null && input.startsWith("/") && '\n' !in input) {
+                matchingSkills(input.drop(1), enabledSkillIds)
+            } else emptyList()
+            if (slashMatches.isNotEmpty()) SkillSuggestions(slashMatches, onPick = ::useSkill)
             InputBar(
                 value = input,
                 onValueChange = { input = it },
                 enabled = canSend,
                 isGenerating = isGenerating,
                 imageMode = imageMode,
+                persona = persona,
+                activeSkill = activeSkill,
+                onOpenPersonality = { sheetTab = ComposerSheetTab.Personality },
+                onOpenSkills = { sheetTab = ComposerSheetTab.Skills },
+                onClearSkill = { activeSkillId = null },
                 placeholder = when {
                     imageMode && hasImageModel -> "Describe an image to create…"
                     imageMode -> "Get an image model to create images"
+                    activeSkill != null && !canSend -> "${activeSkill.name} needs a chat model"
+                    activeSkill != null -> activeSkill.placeholder
                     isReady -> "Message ${persona.name}…"
-                    else -> "Load a model to start chatting"
+                    autoSkills && canSend -> "Load a model to chat, or ask for a QR code, reminder…"
+                    else -> "Load a model, or pick a skill"
                 },
-                onSend = {
-                    onSend(input)
-                    input = ""
-                },
+                onSend = ::submit,
                 onStop = onStop
             )
         }
     }
 
-    if (showSwitcher) {
-        PersonaSwitcherSheet(
+    sheetTab?.let { tab ->
+        PersonalitySkillsSheet(
+            initialTab = tab,
             personas = personas,
-            selectedId = persona.id,
-            onDismiss = { showSwitcher = false },
-            onSelect = {
+            selectedPersonaId = persona.id,
+            enabledSkillIds = enabledSkillIds,
+            activeSkillId = activeSkill?.id,
+            skillsAvailable = !imageMode,
+            autoSkills = autoSkills,
+            onAutoSkillsChange = onAutoSkillsChange,
+            onSelectPersona = {
                 onSelectPersona(it)
-                showSwitcher = false
+                sheetTab = null
             },
-            onBrowseAll = {
-                showSwitcher = false
+            onBrowsePersonas = {
+                sheetTab = null
                 onBrowsePersonas()
             },
-            onCreate = {
-                showSwitcher = false
+            onCreatePersona = {
+                sheetTab = null
                 onCreatePersona()
-            }
+            },
+            onUseSkill = ::useSkill,
+            onToggleSkill = { skill, on ->
+                onToggleSkill(skill.id, on)
+                if (!on && activeSkillId == skill.id) activeSkillId = null
+            },
+            onDismiss = { sheetTab = null }
         )
     }
 }
@@ -360,7 +505,9 @@ private fun EmptyState(
     needsChatModel: Boolean,
     onStarter: (String) -> Unit,
     onPickModel: () -> Unit,
-    onOpenModelCenter: () -> Unit
+    onOpenModelCenter: () -> Unit,
+    skills: List<Skill>,
+    onUseSkill: (Skill) -> Unit
 ) {
     Column(
         Modifier
@@ -404,6 +551,22 @@ private fun EmptyState(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 persona.starters.forEach { starter -> Chip(starter, onClick = { onStarter(starter) }) }
+            }
+        }
+        if (skills.isNotEmpty()) {
+            Spacer(Modifier.height(24.dp))
+            Text(
+                "Or use a skill",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(10.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                skills.forEach { skill -> Chip("${skill.emoji}  ${skill.name}", onClick = { onUseSkill(skill) }) }
             }
         }
         Spacer(Modifier.height(24.dp))
@@ -485,7 +648,12 @@ private fun ModelBanner(modelState: ModelState, onPickModel: () -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MessageBubble(message: ChatMessage, persona: Persona, onRemember: (String) -> Unit) {
+private fun MessageBubble(
+    message: ChatMessage,
+    persona: Persona,
+    onRemember: (String) -> Unit,
+    onReplyAsChat: ((String) -> Unit)? = null
+) {
     val context = LocalContext.current
     @Suppress("DEPRECATION")
     val clipboard = LocalClipboardManager.current
@@ -496,7 +664,15 @@ private fun MessageBubble(message: ChatMessage, persona: Persona, onRemember: (S
 
     if (message.isUser) {
         var menuOpen by remember { mutableStateOf(false) }
-        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+            message.skill?.let { skill ->
+                SkillLabel(
+                    skill,
+                    auto = message.isAutoSkill,
+                    onReplyAsChat = onReplyAsChat?.takeIf { message.isAutoSkill }?.let { send -> { send(message.text) } },
+                    modifier = Modifier.padding(end = 8.dp, bottom = 4.dp)
+                )
+            }
             Box {
                 Box(
                     Modifier
@@ -566,6 +742,10 @@ private fun MessageBubble(message: ChatMessage, persona: Persona, onRemember: (S
                         }
                     }
                 }
+                val skill = message.skill
+                if (skill != null && !message.isStreaming && !message.isError && parsed.answer.isNotBlank()) {
+                    SkillReplyActions(message, skill, parsed.answer)
+                }
             }
             Spacer(Modifier.width(24.dp))
         }
@@ -604,6 +784,11 @@ private fun InputBar(
     enabled: Boolean,
     isGenerating: Boolean,
     imageMode: Boolean,
+    persona: Persona,
+    activeSkill: Skill?,
+    onOpenPersonality: () -> Unit,
+    onOpenSkills: () -> Unit,
+    onClearSkill: () -> Unit,
     placeholder: String,
     onSend: () -> Unit,
     onStop: () -> Unit
@@ -616,28 +801,65 @@ private fun InputBar(
                 .padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.Bottom
         ) {
-            TextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier
+            // One rounded field: who you're talking to on the left, skills on the right, and the
+            // skill your next message goes to as a chip above the text.
+            Column(
+                Modifier
                     .weight(1f)
-                    .heightIn(min = 52.dp),
-                enabled = enabled,
-                placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                shape = RoundedCornerShape(26.dp),
-                maxLines = 5,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                colors = TextFieldDefaults.colors(
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                    disabledIndicatorColor = Color.Transparent,
-                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    disabledContainerColor = MaterialTheme.colorScheme.surfaceContainer
+                    .clip(RoundedCornerShape(26.dp))
+                    .background(
+                        if (enabled || activeSkill != null) MaterialTheme.colorScheme.surfaceContainerHigh
+                        else MaterialTheme.colorScheme.surfaceContainer
+                    )
+            ) {
+                if (activeSkill != null) {
+                    ActiveSkillChip(activeSkill, onClear = onClearSkill, modifier = Modifier.padding(start = 10.dp, top = 8.dp))
+                }
+                TextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp),
+                    enabled = enabled,
+                    placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    leadingIcon = {
+                        Box(
+                            Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .clickable(onClickLabel = "Switch personality", onClick = onOpenPersonality),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            PersonaAvatar(persona, size = 32.dp)
+                        }
+                    },
+                    trailingIcon = if (imageMode) null else {
+                        {
+                            IconButton(onClick = onOpenSkills) {
+                                Icon(
+                                    Icons.Outlined.Bolt,
+                                    contentDescription = "Skills",
+                                    tint = activeSkill?.let { Color(it.colorStart) } ?: MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    },
+                    maxLines = 5,
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                    colors = TextFieldDefaults.colors(
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                        disabledIndicatorColor = Color.Transparent,
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        disabledContainerColor = Color.Transparent
+                    )
                 )
-            )
+            }
             Spacer(Modifier.width(8.dp))
-            val canSend = enabled && value.isNotBlank() && !isGenerating
+            val hasInput = value.isNotBlank() || activeSkill?.emptyPrompt != null
+            val canSend = enabled && hasInput && !isGenerating
             val active = isGenerating || canSend
             val activeBrush = if (imageMode) {
                 Brush.linearGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary))
@@ -665,107 +887,6 @@ private fun InputBar(
                     },
                     tint = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun PersonaSwitcherSheet(
-    personas: List<Persona>,
-    selectedId: String,
-    onDismiss: () -> Unit,
-    onSelect: (String) -> Unit,
-    onBrowseAll: () -> Unit,
-    onCreate: () -> Unit
-) {
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = MaterialTheme.colorScheme.surface
-    ) {
-        Column(Modifier.padding(bottom = 24.dp)) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Switch personality", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                Text(
-                    "See all",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onBrowseAll)
-                        .padding(8.dp)
-                )
-            }
-            Spacer(Modifier.height(12.dp))
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = 20.dp),
-                horizontalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                item {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .width(76.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable(onClick = onCreate)
-                    ) {
-                        Box(
-                            Modifier
-                                .size(64.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text("Create", style = MaterialTheme.typography.labelMedium, maxLines = 1)
-                    }
-                }
-                items(personas, key = { it.id }) { persona ->
-                    val selected = persona.id == selectedId
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .width(76.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { onSelect(persona.id) }
-                    ) {
-                        Box(contentAlignment = Alignment.BottomEnd) {
-                            PersonaAvatar(persona, size = 64.dp)
-                            if (selected) {
-                                Box(
-                                    Modifier
-                                        .size(22.dp)
-                                        .clip(CircleShape)
-                                        .background(MaterialTheme.colorScheme.surface)
-                                        .padding(2.dp)
-                                        .clip(CircleShape)
-                                        .background(persona.brush()),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.Default.Check, contentDescription = "Current", tint = Color.White, modifier = Modifier.size(14.dp))
-                                }
-                            }
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            persona.name,
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 2,
-                            textAlign = TextAlign.Center,
-                            overflow = TextOverflow.Ellipsis,
-                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
             }
         }
     }

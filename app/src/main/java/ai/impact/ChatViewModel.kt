@@ -9,12 +9,23 @@ import android.text.format.Formatter
 import android.util.Log
 import ai.impact.data.BuiltInPersonas
 import ai.impact.data.Persona
+import ai.impact.data.ReplyLimiter
 import ai.impact.data.ResponseParser
 import ai.impact.data.history.StoredMessage
 import ai.impact.data.memory.MemoryCategory
 import ai.impact.data.memory.MemoryEntity
 import ai.impact.data.memory.MemoryRepository
 import ai.impact.data.memory.MemorySource
+import ai.impact.data.skills.BuiltInSkills
+import ai.impact.data.skills.QrCodes
+import ai.impact.data.skills.Skill
+import ai.impact.data.skills.SkillAction
+import ai.impact.data.skills.SkillTag
+import ai.impact.data.skills.PhoneNumbers
+import ai.impact.data.skills.SkillRouter
+import ai.impact.data.skills.ShareTarget
+import ai.impact.data.skills.TimeParser
+import ai.impact.data.skills.Wikipedia
 import ai.impact.image.PromptEnhancement
 import ai.impact.models.CatalogTextModel
 import ai.impact.models.toDownloadSpec
@@ -58,9 +69,23 @@ data class ChatMessage(
     val imageWidth: Int? = null,
     val imageHeight: Int? = null,
     /** Live progress while that image is being painted. */
-    val imageProgress: GenerationState.Running? = null
+    val imageProgress: GenerationState.Running? = null,
+    /** The skill this message was sent with, or that produced this reply. */
+    val skillId: String? = null,
+    /** Skill-specific detail: a reminder's time, a Wikipedia article's title and link. */
+    val skillArg: String? = null
 ) {
     val isImage: Boolean get() = imageId != null || imageProgress != null
+    val skill: Skill? get() = BuiltInSkills.byId(skillId)
+    /** The user didn't pick [skill]; it was chosen from what they wrote. */
+    val isAutoSkill: Boolean get() = isUser && skillId != null && skillArg == ChatViewModel.AUTO_SKILL
+}
+
+/** Something a skill needs the screen to do, since only it can start other apps. */
+sealed interface SkillEffect {
+    data class AddToCalendar(val title: String, val triggerAt: Long) : SkillEffect
+    /** Open [target]'s app with [text] ready to send (to [phone]'s chat, for WhatsApp). */
+    data class SendToApp(val target: ShareTarget, val text: String, val phone: String?) : SkillEffect
 }
 
 /** What sending a message in the chat produces. */
@@ -85,6 +110,8 @@ private enum class PromptFormat { Llama3, Gemma, ChatML }
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
+        /** Marks a user message whose skill was picked automatically (stored as its skill arg). */
+        const val AUTO_SKILL = "auto"
         private const val TAG = "ChatViewModel"
         private const val CONTEXT_LENGTH = 2048
         private const val CHARS_PER_TOKEN = 3.5
@@ -104,6 +131,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val memory = app.memory
     private val memoryExtractor = app.memoryExtractor
     private val textModels = app.textModels
+    /** Notifications scheduled by the "Schedule a notification" skill. */
+    val reminders = app.reminders
+
+    private val _skillEffects = MutableSharedFlow<SkillEffect>(extraBufferCapacity = 4)
+    val skillEffects: SharedFlow<SkillEffect> = _skillEffects.asSharedFlow()
+    // A skill's own work before (or instead of) the model answering, such as a Wikipedia lookup.
+    private var skillJob: Job? = null
 
     /** Downloaded chat models and in-progress downloads, for the Models screen. */
     val installedTextModels = textModels.installed
@@ -237,6 +271,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         text = text.substring(0, markerIndex)
                         hitStopMarker = true
                     }
+                    // The engine can't cap reply length, so stop once the answer runs past the chosen length.
+                    ReplyLimiter.clip(text, preferences.wordLimit.value)?.let { clipped ->
+                        text = clipped
+                        hitStopMarker = true
+                    }
                     val thinkingMillis = last.thinkingMillis
                         ?: if (ResponseParser.hasFinishedThinking(text)) System.currentTimeMillis() - last.createdAt else null
                     current.dropLast(1) + last.copy(text = text, thinkingMillis = thinkingMillis)
@@ -281,7 +320,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun finishGeneration(session: Session) {
+    private fun finishGeneration(session: Session, userStopped: Boolean = false) {
         if (generating !== session) return
         var reply: ChatMessage? = null
         updateSession(session) { current ->
@@ -294,9 +333,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _isGenerating.value = false
 
         reply?.takeIf { it.text != "…" }?.let { message ->
+            // A finished draft goes straight to its app; the user still reviews it there before sending.
+            val target = message.skill?.share
+            val answer = ResponseParser.parse(message.text).answer
+            if (target != null && !userStopped && answer.isNotBlank()) {
+                _skillEffects.tryEmit(SkillEffect.SendToApp(target, answer, message.skillArg))
+            }
             persist {
                 val id = session.dbId ?: return@persist
-                history.addMessage(id, StoredMessage(false, message.text, message.createdAt, message.thinkingMillis))
+                val stored = SkillTag.encode(message.skillId, message.skillArg, message.text)
+                history.addMessage(id, StoredMessage(false, stored, message.createdAt, message.thinkingMillis))
             }
         }
     }
@@ -469,29 +515,192 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         preferences.setChatMode(mode.ordinal)
     }
 
-    /** Sends [userText] as a chat message or an image request, depending on the mode. */
-    fun send(userText: String) {
-        if (_chatMode.value == ChatMode.Image) requestImage(userText) else sendMessage(userText)
+    fun setSkillEnabled(id: String, enabled: Boolean) = preferences.setSkillEnabled(id, enabled)
+
+    fun cancelNotification(id: Int) = reminders.cancel(id)
+
+    /**
+     * Sends [userText] as a chat message or an image request, depending on the mode. With a
+     * [skill], the skill decides what happens to it instead.
+     */
+    fun send(userText: String, skill: Skill? = null, auto: Boolean = false) {
+        if (_chatMode.value == ChatMode.Image) return requestImage(userText)
+        val text = userText.trim().ifEmpty { skill?.emptyPrompt.orEmpty() }
+        when (skill?.action) {
+            null, SkillAction.Chat ->
+                if (skill?.share != null && _modelState.value !is ModelState.Ready) sendWithoutDraft(text, skill, auto)
+                else sendMessage(text, skill, auto)
+            SkillAction.Wikipedia -> askWikipedia(text, skill, auto)
+            SkillAction.QrCode -> makeQrCode(text, skill, auto)
+            SkillAction.Reminder, SkillAction.Notification -> scheduleReminder(text, skill, auto)
+            SkillAction.Image -> requestImage(text, skill, auto)
+        }
     }
 
-    private fun requestImage(userText: String) {
-        val text = userText.trim()
-        val generator = imageGenerator
-        if (text.isEmpty() || _isGenerating.value || generator == null) return
-
-        val session = active
-        val userMessage = newMessage(text, isUser = true)
-        val placeholder = newMessage("", isUser = false, isStreaming = true)
-        updateSession(session) { it + userMessage + placeholder }
-        generating = session
-        _isGenerating.value = true
+    /**
+     * Adds the user's turn and saves it, creating the conversation on its first message. An
+     * [auto] turn is one whose skill was picked for the user, which the chat labels as such.
+     */
+    private fun addUserTurn(session: Session, text: String, skill: Skill?, auto: Boolean = false): ChatMessage {
+        val arg = if (auto && skill != null) AUTO_SKILL else null
+        val userMessage = newMessage(text, isUser = true).copy(skillId = skill?.id, skillArg = arg)
+        updateSession(session) { it + userMessage }
         persist {
             val id = session.dbId ?: history.createConversation(session.personaId, text).also { newId ->
                 session.dbId = newId
                 if (session === active) _activeConversationId.value = newId
             }
-            history.addMessage(id, StoredMessage(true, text, userMessage.createdAt, null))
+            history.addMessage(id, StoredMessage(true, SkillTag.encode(skill?.id, arg, text), userMessage.createdAt, null))
         }
+        return userMessage
+    }
+
+    /** Saves a finished reply to the conversation's history. */
+    private fun persistReply(session: Session, reply: ChatMessage) = persist {
+        val id = session.dbId ?: return@persist
+        history.addMessage(id, StoredMessage(false, SkillTag.encode(reply.skillId, reply.skillArg, reply.text), reply.createdAt, null))
+    }
+
+    /** Adds a finished reply no model wrote (a QR code, a scheduled reminder) and saves it. */
+    private fun addSkillReply(session: Session, reply: ChatMessage) {
+        updateSession(session) { it + reply }
+        persistReply(session, reply)
+    }
+
+    /** A reply explaining why a skill couldn't run; shown, but not saved. */
+    private fun addNotice(session: Session, text: String) = updateSession(session) {
+        it + newMessage(text, isUser = false, isError = true)
+    }
+
+    private fun endTurn(session: Session) {
+        if (generating === session) generating = null
+        _isGenerating.value = false
+    }
+
+    private fun startPrediction(prompt: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                llamaHelper.predict(prompt)
+            } catch (e: Exception) {
+                Log.e(TAG, "predict() failed", e)
+                handleEvent(LlamaHelper.LLMEvent.Error(e.message ?: "prediction failed"))
+            }
+        }
+    }
+
+    private fun askWikipedia(text: String, skill: Skill, auto: Boolean = false) {
+        if (text.isEmpty() || _isGenerating.value || oneShot != null) return
+        val session = active
+        addUserTurn(session, text, skill, auto)
+        val placeholder = newMessage("", isUser = false, isStreaming = true).copy(skillId = skill.id)
+        updateSession(session) { it + placeholder }
+        generating = session
+        _isGenerating.value = true
+
+        fun updatePlaceholder(transform: (ChatMessage) -> ChatMessage?) = updateSession(session) { current ->
+            current.mapNotNull { if (it.id == placeholder.id) transform(it) else it }
+        }
+
+        skillJob = viewModelScope.launch {
+            val article = try {
+                Wikipedia.lookup(text)
+            } catch (e: CancellationException) {
+                updatePlaceholder { null }
+                endTurn(session)
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Wikipedia lookup failed", e)
+                val reason = (e as? Wikipedia.LookupException)?.message
+                    ?: "Couldn't reach Wikipedia. Check your internet connection and try again."
+                updatePlaceholder { it.copy(text = reason, isStreaming = false, isError = true) }
+                endTurn(session)
+                return@launch
+            } finally {
+                skillJob = null
+            }
+            val source = "${article.title}\n${article.url}"
+            if (_modelState.value is ModelState.Ready && oneShot == null && generating === session) {
+                // The model answers in the persona's voice, grounded in the article.
+                updatePlaceholder { it.copy(skillArg = source) }
+                val grounding = "Skill: Query Wikipedia. Answer the user's last question using only the Wikipedia " +
+                    "extract below. If it doesn't hold the answer, say so briefly and share what the article does say.\n\n" +
+                    "Wikipedia article \"${article.title}\":\n${article.extract}"
+                startPrediction(buildPrompt(persona.value, session.messages, grounding))
+            } else {
+                // No chat model loaded: the article's introduction is the answer.
+                var reply: ChatMessage? = null
+                updatePlaceholder {
+                    it.copy(text = "**${article.title}**\n\n${article.extract}", isStreaming = false, skillArg = source)
+                        .also { done -> reply = done }
+                }
+                endTurn(session)
+                reply?.let { persistReply(session, it) }
+            }
+        }
+    }
+
+    /** With no chat model to draft it, a sharing skill sends the typed text to its app as it is. */
+    private fun sendWithoutDraft(text: String, skill: Skill, auto: Boolean = false) {
+        val target = skill.share ?: return
+        if (text.isEmpty() || _isGenerating.value) return
+        val session = active
+        addUserTurn(session, text, skill, auto)
+        val phone = if (target == ShareTarget.WhatsApp) PhoneNumbers.find(text) else null
+        // A request like "send a WhatsApp to mom saying I'm late" sends just "I'm late".
+        val body = if (auto) SkillRouter.messageBody(text) else text
+        addSkillReply(session, newMessage(body, isUser = false).copy(skillId = skill.id, skillArg = phone))
+        _skillEffects.tryEmit(SkillEffect.SendToApp(target, body, phone))
+    }
+
+    private fun makeQrCode(text: String, skill: Skill, auto: Boolean = false) {
+        if (text.isEmpty() || _isGenerating.value) return
+        val session = active
+        addUserTurn(session, text, skill, auto)
+        // "Make a QR code for example.com" encodes just "example.com".
+        val content = if (auto) SkillRouter.qrContent(text) else text
+        if (content.length > QrCodes.MAX_LENGTH) {
+            addNotice(session, "That's too long for one QR code. Keep it under ${QrCodes.MAX_LENGTH} characters.")
+        } else {
+            addSkillReply(session, newMessage(content, isUser = false).copy(skillId = skill.id))
+        }
+    }
+
+    private fun scheduleReminder(text: String, skill: Skill, auto: Boolean = false) {
+        if (text.isEmpty() || _isGenerating.value) return
+        val session = active
+        addUserTurn(session, text, skill, auto)
+        val parsed = TimeParser.parse(text)
+        if (parsed == null) {
+            addNotice(session, "When should I remind you? Add a time, like \"in 20 minutes\", \"at 6pm\" or \"tomorrow morning\".")
+            return
+        }
+        if (skill.action == SkillAction.Notification) {
+            val scheduled = reminders.schedule(parsed.title, parsed.triggerAt)
+            val reply = newMessage(parsed.title, isUser = false)
+            addSkillReply(session, reply.copy(skillId = skill.id, skillArg = "${scheduled.triggerAt};${scheduled.id}"))
+        } else {
+            val reply = newMessage(parsed.title, isUser = false)
+            addSkillReply(session, reply.copy(skillId = skill.id, skillArg = parsed.triggerAt.toString()))
+            _skillEffects.tryEmit(SkillEffect.AddToCalendar(parsed.title, parsed.triggerAt))
+        }
+    }
+
+    /**
+     * Paints [userText] with the image model: from image mode, or from chat through the image
+     * skill. An [auto] request paints just its subject ("draw a cat in space" → "a cat in space").
+     */
+    private fun requestImage(userText: String, skill: Skill? = null, auto: Boolean = false) {
+        val text = userText.trim()
+        val generator = imageGenerator
+        if (text.isEmpty() || _isGenerating.value || generator == null) return
+        val prompt = if (auto) SkillRouter.imagePrompt(text) else text
+
+        val session = active
+        addUserTurn(session, text, skill, auto)
+        val placeholder = newMessage("", isUser = false, isStreaming = true)
+        updateSession(session) { it + placeholder }
+        generating = session
+        _isGenerating.value = true
 
         fun replacePlaceholder(transform: (ChatMessage) -> ChatMessage?) = updateSession(session) { current ->
             current.mapNotNull { if (it.id == placeholder.id) transform(it) else it }
@@ -499,7 +708,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         imageJob = viewModelScope.launch {
             try {
-                val done = generator.generate(text) { running ->
+                val done = generator.generate(prompt) { running ->
                     replacePlaceholder { it.copy(imageProgress = running) }
                 }
                 val image = done.image
@@ -533,40 +742,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendMessage(userText: String) {
+    fun sendMessage(userText: String, skill: Skill? = null, auto: Boolean = false) {
         val text = userText.trim()
         if (text.isEmpty() || _modelState.value !is ModelState.Ready || _isGenerating.value || oneShot != null) return
 
         val session = active
-        val userMessage = newMessage(text, isUser = true)
-        updateSession(session) { it + userMessage }
-        val prompt = buildPrompt(persona.value, session.messages)
-        updateSession(session) { it + newMessage("", isUser = false, isStreaming = true) }
+        addUserTurn(session, text, skill, auto)
+        val prompt = buildPrompt(persona.value, session.messages, skill?.instruction?.takeIf { it.isNotBlank() })
+        // For WhatsApp, a number in the request says whose chat the draft should open in.
+        val phone = if (skill?.share == ShareTarget.WhatsApp) PhoneNumbers.find(text) else null
+        updateSession(session) {
+            it + newMessage("", isUser = false, isStreaming = true).copy(skillId = skill?.id, skillArg = phone)
+        }
 
         generating = session
         _isGenerating.value = true
 
-        persist {
-            val id = session.dbId ?: history.createConversation(session.personaId, text).also { newId ->
-                session.dbId = newId
-                if (session === active) _activeConversationId.value = newId
-            }
-            history.addMessage(id, StoredMessage(true, text, userMessage.createdAt, null))
-        }
-        if (preferences.autoMemory.value) learnFrom(text)
-
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                llamaHelper.predict(prompt)
-            } catch (e: Exception) {
-                Log.e(TAG, "predict() failed", e)
-                handleEvent(LlamaHelper.LLMEvent.Error(e.message ?: "prediction failed"))
-            }
-        }
+        // A skill request ("write an X post about…") isn't the user telling us about themselves.
+        if (skill == null && preferences.autoMemory.value) learnFrom(text)
+        startPrediction(prompt)
     }
 
     fun stopGeneration() {
         imageJob?.let {
+            it.cancel()
+            return
+        }
+        skillJob?.let {
             it.cancel()
             return
         }
@@ -576,7 +778,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         } catch (e: Exception) {
             Log.w(TAG, "stopPrediction failed", e)
         }
-        finishGeneration(session)
+        finishGeneration(session, userStopped = true)
     }
 
     /** Starts a fresh conversation with the current persona. The previous one stays in history. */
@@ -658,16 +860,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun toChatMessage(stored: StoredMessage) = ChatMessage(
-        nextMessageId++,
-        stored.text,
-        stored.isUser,
-        createdAt = stored.createdAt,
-        thinkingMillis = stored.thinkingMillis,
-        imageId = stored.imageId,
-        imageWidth = stored.imageWidth,
-        imageHeight = stored.imageHeight
-    )
+    private fun toChatMessage(stored: StoredMessage): ChatMessage {
+        val decoded = SkillTag.decode(stored.text)
+        return ChatMessage(
+            nextMessageId++,
+            decoded.text,
+            stored.isUser,
+            createdAt = stored.createdAt,
+            thinkingMillis = stored.thinkingMillis,
+            imageId = stored.imageId,
+            imageWidth = stored.imageWidth,
+            imageHeight = stored.imageHeight,
+            skillId = decoded.skillId,
+            skillArg = decoded.arg
+        )
+    }
 
     // endregion
 
@@ -756,7 +963,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * Builds a multi-turn prompt in the model's native chat template, keeping as much recent
      * history as fits in the context window after reserving room for the reply.
      */
-    private fun buildPrompt(persona: Persona, history: List<ChatMessage>): String {
+    private fun buildPrompt(persona: Persona, history: List<ChatMessage>, skillInstruction: String? = null): String {
         val wordLimit = preferences.wordLimit.value
         val memoryContext = if (preferences.useMemory.value) MemoryRepository.formatForPrompt(memories.value) else null
         val system = buildString {
@@ -766,6 +973,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 append("(use it naturally when relevant; never recite the list):\n")
                 append(memoryContext)
             }
+            if (skillInstruction != null) append("\n\nFor this reply only. ").append(skillInstruction)
         }
         val replyTokens = (wordLimit * 1.5).toInt() + 32
         val budgetChars = ((CONTEXT_LENGTH - replyTokens) * CHARS_PER_TOKEN).toInt() - system.length
@@ -773,8 +981,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val turns = ArrayDeque<ChatMessage>()
         var used = 0
         // Image requests and the images they produced aren't conversation the text model can follow.
+        // Nor are QR codes and scheduled reminders, which no model wrote.
         val imageTurns = history.indices.filter { i ->
-            history[i].isImage || (history[i].isUser && history.getOrNull(i + 1)?.isImage == true)
+            history[i].isImage || (history[i].isUser && history.getOrNull(i + 1)?.isImage == true) ||
+                history[i].skill?.isTool == true
         }.map { history[it].id }.toSet()
         for (message in history.asReversed()) {
             if (message.isError || message.text.isBlank() || message.id in imageTurns) continue

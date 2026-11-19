@@ -2,8 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Only used to download image models; chats and generated images never leave the device. -->
+    <!-- Used to download models and, only when you use the Query Wikipedia skill, to look things up.
+         Chats and generated images never leave the device. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The "Schedule a notification" skill: post it on time, and set it again after a restart. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Saving a generated image to Photos needs this only on Android 9 and older. -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -31,6 +36,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <receiver
+            android:name=".data.skills.ReminderReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".data.skills.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Shares generated images with other apps without exposing app storage. -->
         <provider

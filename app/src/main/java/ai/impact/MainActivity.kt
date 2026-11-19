@@ -256,7 +256,7 @@ class MainActivity : ComponentActivity() {
                         appVersion = BuildConfig.VERSION_NAME,
                         onBack = { route = Routes.CHAT },
                         onUserNameChange = prefs::setUserName,
-                        onWordLimitChange = prefs::setWordLimit,
+                        onReplyLengthChange = prefs::setReplyLength,
                         onThemeModeChange = prefs::setThemeMode,
                         onOpenPersonas = { route = Routes.PERSONAS },
                         onCreatePersona = { openEditor(null, Routes.SETTINGS) },
@@ -457,6 +457,9 @@ class MainActivity : ComponentActivity() {
                     val chatMode by viewModel.chatMode.collectAsStateWithLifecycle()
                     val imageModels by imageViewModel.installed.collectAsStateWithLifecycle()
                     val gallery by imageViewModel.images.collectAsStateWithLifecycle()
+                    val enabledSkillIds by prefs.enabledSkillIds.collectAsStateWithLifecycle()
+                    val autoSkills by prefs.autoSkills.collectAsStateWithLifecycle()
+                    val scheduledNotifications by viewModel.reminders.scheduled.collectAsStateWithLifecycle()
                     val imageActions = remember(gallery) {
                         val byId = gallery.associateBy { it.id }
                         ChatImageActions(
@@ -492,7 +495,14 @@ class MainActivity : ComponentActivity() {
                         onChatModeChange = viewModel::setChatMode,
                         hasImageModel = imageModels.isNotEmpty(),
                         onGetImageModel = { openModels(ModelsTab.Image, Routes.CHAT) },
-                        images = imageActions
+                        images = imageActions,
+                        enabledSkillIds = enabledSkillIds,
+                        onToggleSkill = viewModel::setSkillEnabled,
+                        skillEffects = viewModel.skillEffects,
+                        scheduledNotifications = scheduledNotifications,
+                        onCancelNotification = viewModel::cancelNotification,
+                        autoSkills = autoSkills,
+                        onAutoSkillsChange = prefs::setAutoSkills
                     )
                 }
             }

@@ -1,5 +1,7 @@
 package ai.impact.ui.history
 
+import ai.impact.data.skills.BuiltInSkills
+import ai.impact.data.skills.SkillTag
 import ai.impact.data.Persona
 import ai.impact.data.ResponseParser
 import ai.impact.data.history.ConversationSummary
@@ -315,7 +317,11 @@ private fun EmptyHistory(modifier: Modifier) {
 /** One-line plain-text preview: drops reasoning blocks and markdown symbols. */
 internal fun previewOf(text: String?): String {
     if (text.isNullOrBlank()) return "No messages"
-    val answer = ResponseParser.parse(text).answer.ifBlank { text }
+    val decoded = SkillTag.decode(text)
+    // A skill reply shows what it was: "QR code: …", "Reminder: …".
+    val skillLabel = decoded.skillId?.let { BuiltInSkills.byId(it)?.takeIf { s -> s.isTool }?.name }
+    if (skillLabel != null) return "$skillLabel: ${decoded.text.trim()}"
+    val answer = ResponseParser.parse(decoded.text).answer.ifBlank { decoded.text }
     return answer
         .replace(Regex("```[\\s\\S]*?(```|$)"), " [code] ")
         .replace(Regex("[*_`#>~]"), "")

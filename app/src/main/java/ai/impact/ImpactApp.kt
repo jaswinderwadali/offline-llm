@@ -8,6 +8,7 @@ import ai.impact.data.memory.HeuristicMemoryExtractor
 import ai.impact.data.memory.MemoryDatabase
 import ai.impact.data.memory.MemoryExtractor
 import ai.impact.data.memory.MemoryRepository
+import ai.impact.data.skills.Reminders
 import ai.impact.image.ImageGallery
 import ai.impact.image.ImageModelStore
 import ai.impact.models.TextModelStore
@@ -32,6 +33,9 @@ class ImpactApp : Application() {
     val textModels: TextModelStore by lazy { TextModelStore(this, appScope) }
     val imageModels: ImageModelStore by lazy { ImageModelStore(this, appScope) }
     val gallery: ImageGallery by lazy { ImageGallery(this) }
+
+    /** Notifications scheduled by the chat's skills. */
+    val reminders: Reminders by lazy { Reminders(this) }
 
     override fun onCreate() {
         super.onCreate()

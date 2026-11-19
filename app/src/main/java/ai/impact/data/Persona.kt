@@ -27,7 +27,10 @@ data class Persona(
         if (!userName.isNullOrBlank()) {
             append("\n\nThe user's name is ${userName.trim()}. Use it naturally, not in every message.")
         }
-        append("\n\nStay in character as $name. Keep replies under $wordLimit words.")
+        append("\n\nStay in character as $name.")
+        // Small models follow a sentence count better than a word count, so give both.
+        val sentences = (wordLimit / 18).coerceAtLeast(2)
+        append(" Keep every reply under $wordLimit words (about $sentences sentences) and end on a complete sentence.")
         append(" Never claim to be human or a licensed professional.")
         append(" If the user mentions self-harm, suicide, or being in danger, respond with care and")
         append(" encourage them to contact local emergency services or a crisis helpline right away.")
