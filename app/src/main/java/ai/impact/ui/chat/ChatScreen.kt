@@ -1,5 +1,23 @@
 package ai.impact.ui.chat
 
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import ai.impact.data.documents.DocumentEntity
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import ai.impact.VoiceState
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import ai.impact.data.documents.DocumentSource
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.TextButton
 import ai.impact.ChatMessage
 import ai.impact.ModelState
 import ai.impact.data.Persona
@@ -59,6 +77,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDownload
@@ -107,7 +127,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.SolidColor
-import ai.impact.ChatMode
 import ai.impact.SkillEffect
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -145,13 +164,13 @@ fun ChatScreen(
     onPickModel: () -> Unit,
     onOpenModelCenter: () -> Unit,
     onOpenSettings: () -> Unit,
+    /** Back to the home tab; the chat opens full screen on top of the main navigation. */
+    onBack: (() -> Unit)? = null,
     onOpenHistory: () -> Unit,
     onOpenMemory: () -> Unit,
     onOpenImageStudio: () -> Unit,
     onRememberMessage: (String) -> Unit,
     memoryEvents: Flow<MemoryEntity>,
-    chatMode: ChatMode,
-    onChatModeChange: (ChatMode) -> Unit,
     hasImageModel: Boolean,
     onGetImageModel: () -> Unit,
     images: ChatImageActions,
@@ -161,24 +180,48 @@ fun ChatScreen(
     scheduledNotifications: List<ScheduledNotification>,
     onCancelNotification: (Int) -> Unit,
     autoSkills: Boolean,
-    onAutoSkillsChange: (Boolean) -> Unit
+    onAutoSkillsChange: (Boolean) -> Unit,
+    draft: String? = null,
+    documentsAvailable: Boolean = false,
+    useDocuments: Boolean = true,
+    onUseDocumentsChange: (Boolean) -> Unit = {},
+    onOpenDocuments: () -> Unit = {},
+    /** The documents chat can search, for the composer's documents sheet. */
+    documents: List<DocumentEntity> = emptyList(),
+    excludedDocuments: Set<Long> = emptySet(),
+    onToggleDocument: (Long) -> Unit = {},
+    /** Hands-free voice mode; null when it's off. */
+    voice: VoiceState? = null,
+    onStartVoice: () -> Unit = {},
+    onVoiceTap: () -> Unit = {},
+    onStopVoice: () -> Unit = {},
+    /** The reply being read aloud, and the button that reads one. */
+    speakingMessageId: Long? = null,
+    onReadAloud: (ChatMessage) -> Unit = {},
+    onDraftConsumed: () -> Unit = {}
 ) {
+    if (onBack != null) BackHandler(onBack = onBack)
     var input by rememberSaveable { mutableStateOf("") }
+    // A check-in's follow-up prompt, ready for the user to send or edit.
+    LaunchedEffect(draft) {
+        if (draft != null) {
+            input = draft
+            onDraftConsumed()
+        }
+    }
     // The sheet opened from the input field (or the title); null when it's closed.
-    var sheetTab by rememberSaveable { mutableStateOf<ComposerSheetTab?>(null) }
+    var showSkills by rememberSaveable { mutableStateOf(false) }
     var activeSkillId by rememberSaveable { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val isReady = modelState is ModelState.Ready
-    val imageMode = chatMode == ChatMode.Image
-    // Skills handle text messages only; image mode keeps its own prompt flow.
-    val activeSkill = BuiltInSkills.byId(activeSkillId).takeUnless { imageMode }
-    // Image mode only needs an image model; the chat model is optional (it can polish prompts).
-    // Tool skills such as QR codes and reminders work with no model at all.
+    val activeSkill = BuiltInSkills.byId(activeSkillId)
+    // Agentic personas always pick skills on their own; others follow the "Use skills automatically" switch.
+    val routeSkills = autoSkills || persona.agentic
+    // Tool skills such as QR codes, reminders and images work with no chat model at all.
     val canSend = when {
-        imageMode -> hasImageModel
         activeSkill != null -> isReady || !activeSkill.needsModel
         // With automatic skills, typing stays open so "make a QR code for…" works without a model.
-        else -> isReady || (autoSkills && BuiltInSkills.all.any { it.id in enabledSkillIds && !it.needsModel })
+        else -> isReady || (routeSkills && BuiltInSkills.all.any { it.id in enabledSkillIds && !it.needsModel })
     }
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
@@ -204,13 +247,21 @@ fun ChatScreen(
     val currentOnSend by rememberUpdatedState(onSend)
     val currentOnToggleSkill by rememberUpdatedState(onToggleSkill)
     val currentEnabledSkillIds by rememberUpdatedState(enabledSkillIds)
-    val currentImageMode by rememberUpdatedState(imageMode)
-    val currentAutoSkills by rememberUpdatedState(autoSkills)
+    val currentRouteSkills by rememberUpdatedState(routeSkills)
     val currentIsReady by rememberUpdatedState(isReady)
     val currentHasImageModel by rememberUpdatedState(hasImageModel)
     val currentOnGetImageModel by rememberUpdatedState(onGetImageModel)
     val scope = rememberCoroutineScope()
     var pendingAuto by remember { mutableStateOf(false) }
+    val currentOnStartVoice by rememberUpdatedState(onStartVoice)
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) currentOnStartVoice()
+        else scope.launch { snackbarHostState.showSnackbar("Voice mode needs microphone access.") }
+    }
+    fun startVoice() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) onStartVoice()
+        else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         pendingSend?.let { (text, skill) -> currentOnSend(text, skill, pendingAuto) }
         pendingSend = null
@@ -218,9 +269,9 @@ fun ChatScreen(
     fun submit() {
         val text = input
         // Read the skill from state at the moment of sending, never from a captured value.
-        val picked = BuiltInSkills.byId(activeSkillId).takeUnless { currentImageMode }
+        val picked = BuiltInSkills.byId(activeSkillId)
         // Nothing picked: use an enabled skill if the message clearly asks for one.
-        val detected = if (picked == null && !currentImageMode && currentAutoSkills) {
+        val detected = if (picked == null && currentRouteSkills) {
             SkillRouter.detect(text, currentEnabledSkillIds)
         } else null
         val skill = picked ?: detected
@@ -235,7 +286,7 @@ fun ChatScreen(
             }
             return
         }
-        if (!currentImageMode && !currentIsReady && (skill == null || skill.needsModel)) {
+        if (!currentIsReady && (skill == null || skill.needsModel)) {
             // Typing is allowed without a model so skills can still run; plain chat can't.
             scope.launch {
                 snackbarHostState.showSnackbar(
@@ -263,7 +314,7 @@ fun ChatScreen(
         if (skill.id !in currentEnabledSkillIds) currentOnToggleSkill(skill.id, true)
         activeSkillId = skill.id
         if (input.startsWith("/")) input = ""
-        sheetTab = null
+        showSkills = false
     }
 
     LaunchedEffect(memoryEvents) {
@@ -285,8 +336,11 @@ fun ChatScreen(
         if (last.isStreaming || last.imageId != null) listState.scrollToItem(messages.lastIndex)
     }
 
+    // The top bar slides away while scrolling up through the chat and returns on scrolling down.
+    val topBarScroll = TopAppBarDefaults.enterAlwaysScrollBehavior()
+    var micCenter by remember { mutableStateOf<Offset?>(null) }
     Scaffold(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.fillMaxSize().nestedScroll(topBarScroll.nestedScrollConnection),
         containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = {
@@ -301,13 +355,13 @@ fun ChatScreen(
         },
         topBar = {
             TopAppBar(
+                navigationIcon = {
+                    if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
+                },
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(14.dp))
-                            .clickable(onClickLabel = "Switch personality") { sheetTab = ComposerSheetTab.Personality }
-                            .padding(vertical = 4.dp, horizontal = 4.dp)
+                        modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp)
                     ) {
                         PersonaAvatar(persona, size = 40.dp)
                         Spacer(Modifier.width(12.dp))
@@ -326,20 +380,15 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onOpenImageStudio) {
-                        Icon(Icons.Outlined.Palette, contentDescription = "Create an image")
-                    }
-                    IconButton(onClick = onOpenHistory) {
-                        Icon(Icons.Default.History, contentDescription = "Chat history")
-                    }
                     IconButton(onClick = onNewChat, enabled = messages.isNotEmpty()) {
                         Icon(Icons.Default.EditNote, contentDescription = "New chat")
                     }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
-                    }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
+                scrollBehavior = topBarScroll,
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    scrolledContainerColor = MaterialTheme.colorScheme.background
+                )
             )
         }
     ) { padding ->
@@ -355,11 +404,11 @@ fun ChatScreen(
                         persona = persona,
                         userName = userName,
                         modelState = modelState,
-                        needsChatModel = !imageMode && activeSkill?.needsModel != false,
+                        needsChatModel = activeSkill?.needsModel != false,
                         onStarter = { if (isReady && activeSkill == null) onSend(it, null, false) else input = it },
                         onPickModel = onPickModel,
                         onOpenModelCenter = onOpenModelCenter,
-                        skills = if (imageMode) emptyList() else BuiltInSkills.all.filter { it.id in enabledSkillIds },
+                        skills = BuiltInSkills.all.filter { it.id in enabledSkillIds },
                         onUseSkill = ::useSkill
                     )
                 } else {
@@ -381,6 +430,8 @@ fun ChatScreen(
                                 }
                             }
                         ) { index, message ->
+                            // New messages fade and slide in; the list eases when items move.
+                            Box(Modifier.animateItem(fadeInSpec = tween(250), placementSpec = spring(stiffness = Spring.StiffnessMediumLow))) {
                             val toolSkill = message.skill?.takeIf { it.isTool && !message.isUser }
                             if (message.isImage) {
                                 val request = messages.getOrNull(index - 1)?.takeIf { it.isUser }?.text
@@ -390,88 +441,78 @@ fun ChatScreen(
                             } else {
                                 MessageBubble(
                                     message, persona, onRemember = onRememberMessage,
+                                    speaking = speakingMessageId == message.id,
+                                    onReadAloud = { onReadAloud(message) },
                                     // Undo for an automatic pick: send the same words as plain chat.
                                     onReplyAsChat = if (isReady && !isGenerating) {
                                         { text -> onSend(text, null, false) }
                                     } else null
                                 )
                             }
+                            }
                         }
                     }
                 }
             }
 
-            if (!imageMode && !isReady && messages.isNotEmpty()) {
+            if (!isReady && messages.isNotEmpty()) {
                 ModelBanner(modelState, onPickModel)
             }
 
-            ModeSwitch(
-                mode = chatMode,
-                enabled = !isGenerating,
-                hasImageModel = hasImageModel,
-                onChange = onChatModeChange,
-                onGetImageModel = onGetImageModel
-            )
             // Typing "/" first lists skills to pick by name.
-            val slashMatches = if (!imageMode && activeSkill == null && input.startsWith("/") && '\n' !in input) {
+            val slashMatches = if (activeSkill == null && input.startsWith("/") && '\n' !in input) {
                 matchingSkills(input.drop(1), enabledSkillIds)
             } else emptyList()
-            if (slashMatches.isNotEmpty()) SkillSuggestions(slashMatches, onPick = ::useSkill)
-            InputBar(
+            AnimatedVisibility(
+                visible = slashMatches.isNotEmpty(),
+                enter = slideInVertically { it / 2 } + fadeIn(),
+                exit = slideOutVertically { it / 2 } + fadeOut()
+            ) {
+                SkillSuggestions(slashMatches, onPick = ::useSkill)
+            }
+            Composer(
                 value = input,
                 onValueChange = { input = it },
                 enabled = canSend,
                 isGenerating = isGenerating,
-                imageMode = imageMode,
                 persona = persona,
                 activeSkill = activeSkill,
-                onOpenPersonality = { sheetTab = ComposerSheetTab.Personality },
-                onOpenSkills = { sheetTab = ComposerSheetTab.Skills },
+                documents = if (documentsAvailable) DocumentsAttachment(documents, useDocuments, excludedDocuments, onUseDocumentsChange, onToggleDocument, onOpenDocuments) else null,
+                onOpenSkills = { showSkills = true },
                 onClearSkill = { activeSkillId = null },
                 placeholder = when {
-                    imageMode && hasImageModel -> "Describe an image to create…"
-                    imageMode -> "Get an image model to create images"
                     activeSkill != null && !canSend -> "${activeSkill.name} needs a chat model"
                     activeSkill != null -> activeSkill.placeholder
                     isReady -> "Message ${persona.name}…"
-                    autoSkills && canSend -> "Load a model to chat, or ask for a QR code, reminder…"
+                    routeSkills && canSend -> "Load a model to chat, or ask for a QR code, reminder…"
                     else -> "Load a model, or pick a skill"
                 },
                 onSend = ::submit,
-                onStop = onStop
+                onStop = onStop,
+                onMic = ::startVoice,
+                onActionButtonPlaced = { micCenter = it }
             )
         }
     }
 
-    sheetTab?.let { tab ->
-        PersonalitySkillsSheet(
-            initialTab = tab,
-            personas = personas,
-            selectedPersonaId = persona.id,
+    if (showSkills) {
+        SkillsSheet(
             enabledSkillIds = enabledSkillIds,
             activeSkillId = activeSkill?.id,
-            skillsAvailable = !imageMode,
+            skillsAvailable = true,
             autoSkills = autoSkills,
             onAutoSkillsChange = onAutoSkillsChange,
-            onSelectPersona = {
-                onSelectPersona(it)
-                sheetTab = null
-            },
-            onBrowsePersonas = {
-                sheetTab = null
-                onBrowsePersonas()
-            },
-            onCreatePersona = {
-                sheetTab = null
-                onCreatePersona()
-            },
             onUseSkill = ::useSkill,
             onToggleSkill = { skill, on ->
                 onToggleSkill(skill.id, on)
                 if (!on && activeSkillId == skill.id) activeSkillId = null
             },
-            onDismiss = { sheetTab = null }
+            onDismiss = { showSkills = false }
         )
+    }
+
+    VoiceReveal(voice, micCenter) { state, reveal, active ->
+        VoiceModeOverlay(state, persona, onTap = onVoiceTap, onEnd = onStopVoice, reveal = reveal, active = active)
     }
 }
 
@@ -652,7 +693,9 @@ private fun MessageBubble(
     message: ChatMessage,
     persona: Persona,
     onRemember: (String) -> Unit,
-    onReplyAsChat: ((String) -> Unit)? = null
+    onReplyAsChat: ((String) -> Unit)? = null,
+    speaking: Boolean = false,
+    onReadAloud: () -> Unit = {}
 ) {
     val context = LocalContext.current
     @Suppress("DEPRECATION")
@@ -742,6 +785,10 @@ private fun MessageBubble(
                         }
                     }
                 }
+                if (message.sources.isNotEmpty() && !message.isError) SourceCards(message.sources)
+                if (!message.isStreaming && !message.isError && parsed.answer.isNotBlank()) {
+                    ReadAloudButton(speaking, onReadAloud)
+                }
                 val skill = message.skill
                 if (skill != null && !message.isStreaming && !message.isError && parsed.answer.isNotBlank()) {
                     SkillReplyActions(message, skill, parsed.answer)
@@ -777,117 +824,28 @@ private fun TypingIndicator() {
     }
 }
 
+/** Reads a reply aloud, or stops it. */
 @Composable
-private fun InputBar(
-    value: String,
-    onValueChange: (String) -> Unit,
-    enabled: Boolean,
-    isGenerating: Boolean,
-    imageMode: Boolean,
-    persona: Persona,
-    activeSkill: Skill?,
-    onOpenPersonality: () -> Unit,
-    onOpenSkills: () -> Unit,
-    onClearSkill: () -> Unit,
-    placeholder: String,
-    onSend: () -> Unit,
-    onStop: () -> Unit
-) {
-    Surface(color = MaterialTheme.colorScheme.background) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 10.dp),
-            verticalAlignment = Alignment.Bottom
-        ) {
-            // One rounded field: who you're talking to on the left, skills on the right, and the
-            // skill your next message goes to as a chip above the text.
-            Column(
-                Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(26.dp))
-                    .background(
-                        if (enabled || activeSkill != null) MaterialTheme.colorScheme.surfaceContainerHigh
-                        else MaterialTheme.colorScheme.surfaceContainer
-                    )
-            ) {
-                if (activeSkill != null) {
-                    ActiveSkillChip(activeSkill, onClear = onClearSkill, modifier = Modifier.padding(start = 10.dp, top = 8.dp))
-                }
-                TextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 52.dp),
-                    enabled = enabled,
-                    placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    leadingIcon = {
-                        Box(
-                            Modifier
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .clickable(onClickLabel = "Switch personality", onClick = onOpenPersonality),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            PersonaAvatar(persona, size = 32.dp)
-                        }
-                    },
-                    trailingIcon = if (imageMode) null else {
-                        {
-                            IconButton(onClick = onOpenSkills) {
-                                Icon(
-                                    Icons.Outlined.Bolt,
-                                    contentDescription = "Skills",
-                                    tint = activeSkill?.let { Color(it.colorStart) } ?: MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    },
-                    maxLines = 5,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                    colors = TextFieldDefaults.colors(
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent,
-                        disabledIndicatorColor = Color.Transparent,
-                        focusedContainerColor = Color.Transparent,
-                        unfocusedContainerColor = Color.Transparent,
-                        disabledContainerColor = Color.Transparent
-                    )
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            val hasInput = value.isNotBlank() || activeSkill?.emptyPrompt != null
-            val canSend = enabled && hasInput && !isGenerating
-            val active = isGenerating || canSend
-            val activeBrush = if (imageMode) {
-                Brush.linearGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary))
-            } else {
-                SolidColor(MaterialTheme.colorScheme.primary)
-            }
-            Box(
-                Modifier
-                    .size(52.dp)
-                    .clip(CircleShape)
-                    .background(if (active) activeBrush else SolidColor(MaterialTheme.colorScheme.surfaceContainerHigh))
-                    .clickable(enabled = active) { if (isGenerating) onStop() else onSend() },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    when {
-                        isGenerating -> Icons.Default.Stop
-                        imageMode -> Icons.Default.AutoAwesome
-                        else -> Icons.AutoMirrored.Filled.Send
-                    },
-                    contentDescription = when {
-                        isGenerating -> "Stop"
-                        imageMode -> "Create image"
-                        else -> "Send"
-                    },
-                    tint = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+private fun ReadAloudButton(speaking: Boolean, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(50),
+        color = if (speaking) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else Color.Transparent
+    ) {
+        Row(Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                if (speaking) Icons.Default.Stop else Icons.AutoMirrored.Filled.VolumeUp,
+                contentDescription = null,
+                tint = if (speaking) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                if (speaking) "Stop" else "Listen",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (speaking) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
+

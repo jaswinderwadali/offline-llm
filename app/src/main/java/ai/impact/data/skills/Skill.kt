@@ -7,8 +7,6 @@ import java.net.URLEncoder
 enum class SkillAction {
     /** The chat model answers, guided by the skill's instruction. */
     Chat,
-    /** Looks the message up on Wikipedia, then answers from the article. */
-    Wikipedia,
     /** Encodes the message as a QR code. */
     QrCode,
     /** Adds the message to the calendar at the time it mentions. */
@@ -71,7 +69,6 @@ data class Skill(
     /** Sent when the user sends without typing anything; null means the skill needs input. */
     val emptyPrompt: String? = null,
     val share: ShareTarget? = null,
-    val usesInternet: Boolean = false,
     val enabledByDefault: Boolean = false
 ) {
     /**
@@ -117,17 +114,6 @@ object BuiltInSkills {
             placeholder = "Stretch in 30 minutes",
             action = SkillAction.Notification,
             colorStart = 0xFFFFB547, colorEnd = 0xFFFF7A45,
-            enabledByDefault = true
-        ),
-        Skill(
-            id = "wikipedia",
-            name = "Query Wikipedia",
-            emoji = "📖",
-            description = "Looks it up on Wikipedia and answers from the article. Sends your question to Wikipedia.",
-            placeholder = "Ask Wikipedia anything…",
-            action = SkillAction.Wikipedia,
-            colorStart = 0xFF5A6B8C, colorEnd = 0xFF8A9BBF,
-            usesInternet = true,
             enabledByDefault = true
         ),
         Skill(

@@ -29,8 +29,6 @@ class SkillRouterTest {
         assertEquals("linkedin", route("Draft a LinkedIn post about my new job"))
         assertEquals("text_spinner", route("Rephrase this: we regret to inform you"))
         assertEquals("learn", route("teach me something about black holes"))
-        assertEquals("wikipedia", route("look up the Eiffel Tower"))
-        assertEquals("wikipedia", route("Who was Ada Lovelace?"))
     }
 
     @Test
@@ -74,6 +72,9 @@ class SkillRouterTest {
         assertNull(route("Can I vent for a minute?"))
         assertNull(route("I keep procrastinating on my LinkedIn profile"))
         assertNull(route("/qr code"))
+        // Factual questions are answered by the chat model, offline.
+        assertNull(route("Who was Ada Lovelace?"))
+        assertNull(route("look up the Eiffel Tower"))
     }
 
     @Test

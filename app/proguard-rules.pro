@@ -25,3 +25,6 @@
 
 # ONNX Runtime JNI: native code looks these classes up by name.
 -keep class ai.onnxruntime.** { *; }
+
+# PdfBox-Android: the JPEG 2000 decoder is an optional add-on we don't ship.
+-dontwarn com.gemalto.jp2.**

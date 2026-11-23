@@ -452,7 +452,7 @@ class ImageViewModel(application: Application) : AndroidViewModel(application) {
 
     // region Chat
 
-    /** Whether an image model is installed, so the chat can offer image mode. */
+    /** Whether an image model is installed, so the chat can create images. */
     val hasImageModel: Boolean get() = installed.value.isNotEmpty()
 
     /**

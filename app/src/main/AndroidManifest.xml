@@ -2,17 +2,28 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Used to download models and, only when you use the Query Wikipedia skill, to look things up.
-         Chats and generated images never leave the device. -->
+    <!-- Only used to download models. Chats, skills and generated images never leave the device. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- The "Schedule a notification" skill: post it on time, and set it again after a restart. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Voice mode: hearing what the user says, on the phone. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Saving a generated image to Photos needs this only on Android 9 and older. -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+
+    <!-- Android 11+ only lets the app see the phone's speech recognizer and voice when it asks. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
 
     <application
         android:name=".ImpactApp"
@@ -39,6 +50,10 @@
 
         <receiver
             android:name=".data.skills.ReminderReceiver"
+            android:exported="false" />
+        <!-- Check-ins: a friendly nudge after the user has been away for a while. -->
+        <receiver
+            android:name=".data.checkins.CheckInReceiver"
             android:exported="false" />
         <receiver
             android:name=".data.skills.BootReceiver"

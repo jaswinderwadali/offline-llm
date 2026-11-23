@@ -7,5 +7,7 @@
 <full-backup-content>
     <exclude domain="external" path="Download/image_models/" />
     <exclude domain="external" path="Download/text_models/" />
+    <exclude domain="external" path="Download/search_models/" />
+    <exclude domain="external" path="Download/speech_models/" />
     <exclude domain="file" path="generated/" />
 </full-backup-content>

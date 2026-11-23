@@ -28,6 +28,18 @@ interface ChatHistoryDao {
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt ASC, id ASC")
     suspend fun getMessages(conversationId: Long): List<MessageEntity>
 
+    /** The user's newest messages across all conversations, for check-in notifications. */
+    @Query(
+        """
+        SELECT m.text AS text, m.conversationId AS conversationId, c.personaId AS personaId, m.createdAt AS createdAt
+        FROM messages m JOIN conversations c ON c.id = m.conversationId
+        WHERE m.isUser = 1 AND m.createdAt >= :since
+        ORDER BY m.createdAt DESC, m.id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun recentUserMessages(since: Long, limit: Int): List<RecentUserMessage>
+
     @Insert
     suspend fun insertConversation(conversation: ConversationEntity): Long
 

@@ -96,52 +96,33 @@ fun SkillAvatar(skill: Skill, size: androidx.compose.ui.unit.Dp = 40.dp, modifie
     EmojiAvatar(skill.emoji, skill.brush(), size, modifier)
 }
 
-/** Which half of the input field's sheet is showing. */
-enum class ComposerSheetTab { Personality, Skills }
-
 /**
- * Opened from inside the input field: switch who you're talking to, or pick and manage the
- * skills that can handle your next message.
+ * Opened from the composer's Skills button: pick a skill for the next message, or switch skills
+ * on and off. (Personalities are chosen on Home.)
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PersonalitySkillsSheet(
-    initialTab: ComposerSheetTab,
-    personas: List<Persona>,
-    selectedPersonaId: String,
+internal fun SkillsSheet(
     enabledSkillIds: Set<String>,
     activeSkillId: String?,
     skillsAvailable: Boolean,
     autoSkills: Boolean,
     onAutoSkillsChange: (Boolean) -> Unit,
-    onSelectPersona: (String) -> Unit,
-    onBrowsePersonas: () -> Unit,
-    onCreatePersona: () -> Unit,
     onUseSkill: (Skill) -> Unit,
     onToggleSkill: (Skill, Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var tab by rememberSaveable { mutableStateOf(initialTab) }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = MaterialTheme.colorScheme.surface
     ) {
-        PrimaryTabRow(
-            selectedTabIndex = tab.ordinal,
-            containerColor = MaterialTheme.colorScheme.surface,
-            modifier = Modifier.padding(horizontal = 16.dp)
-        ) {
-            ComposerSheetTab.entries.forEach { entry ->
-                Tab(
-                    selected = tab == entry,
-                    onClick = { tab = entry },
-                    text = { Text(entry.name) },
-                    selectedContentColor = MaterialTheme.colorScheme.primary,
-                    unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
+        Text(
+            "Skills",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp)
+        )
         Column(
             Modifier
                 .fillMaxWidth()
@@ -149,115 +130,8 @@ internal fun PersonalitySkillsSheet(
                 .verticalScroll(rememberScrollState())
                 .padding(bottom = 24.dp)
         ) {
-            when (tab) {
-                ComposerSheetTab.Personality -> PersonalityTab(personas, selectedPersonaId, onSelectPersona, onBrowsePersonas, onCreatePersona)
-                ComposerSheetTab.Skills -> SkillsTab(
-                    enabledSkillIds, activeSkillId, skillsAvailable, autoSkills, onAutoSkillsChange, onUseSkill, onToggleSkill
-                )
-            }
+            SkillsTab(enabledSkillIds, activeSkillId, skillsAvailable, autoSkills, onAutoSkillsChange, onUseSkill, onToggleSkill)
         }
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun PersonalityTab(
-    personas: List<Persona>,
-    selectedId: String,
-    onSelect: (String) -> Unit,
-    onBrowseAll: () -> Unit,
-    onCreate: () -> Unit
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(start = 24.dp, end = 16.dp, top = 16.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            "Who do you want to talk to?",
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.weight(1f)
-        )
-        TextButton(onClick = onBrowseAll) { Text("Manage") }
-    }
-    Spacer(Modifier.height(8.dp))
-    FlowRow(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        maxItemsInEachRow = 4
-    ) {
-        PersonaTile(
-            label = "Create",
-            selected = false,
-            onClick = onCreate,
-            avatar = {
-                Box(
-                    Modifier
-                        .size(60.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                }
-            }
-        )
-        personas.forEach { persona ->
-            val selected = persona.id == selectedId
-            PersonaTile(
-                label = persona.name,
-                selected = selected,
-                onClick = { onSelect(persona.id) },
-                avatar = {
-                    Box(contentAlignment = Alignment.BottomEnd) {
-                        PersonaAvatar(persona, size = 60.dp)
-                        if (selected) {
-                            Box(
-                                Modifier
-                                    .size(22.dp)
-                                    .clip(CircleShape)
-                                    .background(MaterialTheme.colorScheme.surface)
-                                    .padding(2.dp)
-                                    .clip(CircleShape)
-                                    .background(persona.brush()),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Default.Check, contentDescription = "Current", tint = Color.White, modifier = Modifier.size(14.dp))
-                            }
-                        }
-                    }
-                }
-            )
-        }
-        // Keeps the last row's tiles aligned to the grid instead of spreading out.
-        repeat((4 - (personas.size + 1) % 4) % 4) { Spacer(Modifier.width(76.dp)) }
-    }
-}
-
-@Composable
-private fun PersonaTile(label: String, selected: Boolean, onClick: () -> Unit, avatar: @Composable () -> Unit) {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .width(76.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
-            .padding(vertical = 4.dp)
-    ) {
-        avatar()
-        Spacer(Modifier.height(6.dp))
-        Text(
-            label,
-            style = MaterialTheme.typography.labelMedium,
-            maxLines = 2,
-            textAlign = TextAlign.Center,
-            overflow = TextOverflow.Ellipsis,
-            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-        )
     }
 }
 
@@ -355,7 +229,6 @@ private fun SkillRow(
                     active -> "In use"
                     skill.share != null -> "Opens ${skill.share.label}"
                     skill.action == SkillAction.Image -> "Uses image model"
-                    skill.usesInternet -> "Online"
                     !skill.needsModel -> "No model needed"
                     else -> null
                 }
@@ -658,10 +531,7 @@ private fun CardAction(label: String, icon: androidx.compose.ui.graphics.vector.
     }
 }
 
-/**
- * Actions under a finished reply from a skill: send a drafted post to its app, or open the
- * Wikipedia article an answer came from.
- */
+/** Actions under a finished reply from a sharing skill: send the draft to its app, or copy it. */
 @Composable
 internal fun SkillReplyActions(message: ChatMessage, skill: Skill, answer: String) {
     val context = LocalContext.current
@@ -686,18 +556,6 @@ internal fun SkillReplyActions(message: ChatMessage, skill: Skill, answer: Strin
                 label = { Text("Copy") },
                 leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp)) },
                 shape = RoundedCornerShape(50)
-            )
-        }
-        if (skill.action == SkillAction.Wikipedia) {
-            val (title, url) = message.skillArg?.split('\n')?.let { it.getOrNull(0) to it.getOrNull(1) } ?: return@Row
-            if (title == null || url == null) return@Row
-            AssistChip(
-                onClick = { context.openUrl(url) },
-                label = { Text("Wikipedia · $title", maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                leadingIcon = { Text(skill.emoji) },
-                trailingIcon = { Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(14.dp)) },
-                shape = RoundedCornerShape(50),
-                modifier = Modifier.widthIn(max = 280.dp)
             )
         }
     }
@@ -744,14 +602,6 @@ private fun Context.copyText(text: String, toast: String) {
     getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("TinyAI", text))
     // Android 13+ shows its own confirmation when something is copied.
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) Toast.makeText(this, toast, Toast.LENGTH_SHORT).show()
-}
-
-private fun Context.openUrl(url: String) {
-    try {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-    } catch (e: ActivityNotFoundException) {
-        Toast.makeText(this, "No browser found", Toast.LENGTH_SHORT).show()
-    }
 }
 
 private fun Context.openNotificationSettings() {

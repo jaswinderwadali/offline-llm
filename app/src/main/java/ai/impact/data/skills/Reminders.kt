@@ -153,6 +153,8 @@ class ReminderReceiver : BroadcastReceiver() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
-        (context.applicationContext as ImpactApp).reminders.restore()
+        val app = context.applicationContext as ImpactApp
+        app.reminders.restore()
+        app.checkIns.restore()
     }
 }

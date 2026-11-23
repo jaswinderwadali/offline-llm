@@ -1,5 +1,10 @@
 package ai.impact
 
+import kotlinx.coroutines.delay
+import ai.impact.speech.VoiceGuard
+import ai.impact.speech.SpeakableText
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import android.app.ActivityManager
 import android.app.Application
 import android.content.Intent
@@ -16,6 +21,9 @@ import ai.impact.data.memory.MemoryCategory
 import ai.impact.data.memory.MemoryEntity
 import ai.impact.data.memory.MemoryRepository
 import ai.impact.data.memory.MemorySource
+import ai.impact.data.documents.DocumentContext
+import ai.impact.data.documents.DocumentSource
+import ai.impact.data.documents.SourcesTag
 import ai.impact.data.skills.BuiltInSkills
 import ai.impact.data.skills.QrCodes
 import ai.impact.data.skills.Skill
@@ -25,7 +33,6 @@ import ai.impact.data.skills.PhoneNumbers
 import ai.impact.data.skills.SkillRouter
 import ai.impact.data.skills.ShareTarget
 import ai.impact.data.skills.TimeParser
-import ai.impact.data.skills.Wikipedia
 import ai.impact.image.PromptEnhancement
 import ai.impact.models.CatalogTextModel
 import ai.impact.models.toDownloadSpec
@@ -72,8 +79,10 @@ data class ChatMessage(
     val imageProgress: GenerationState.Running? = null,
     /** The skill this message was sent with, or that produced this reply. */
     val skillId: String? = null,
-    /** Skill-specific detail: a reminder's time, a Wikipedia article's title and link. */
-    val skillArg: String? = null
+    /** Skill-specific detail: a reminder's time, a WhatsApp chat's phone number. */
+    val skillArg: String? = null,
+    /** The user's documents this reply drew on, shown as chips under it. */
+    val sources: List<DocumentSource> = emptyList()
 ) {
     val isImage: Boolean get() = imageId != null || imageProgress != null
     val skill: Skill? get() = BuiltInSkills.byId(skillId)
@@ -81,15 +90,29 @@ data class ChatMessage(
     val isAutoSkill: Boolean get() = isUser && skillId != null && skillArg == ChatViewModel.AUTO_SKILL
 }
 
+enum class VoicePhase { Listening, Thinking, Speaking, Paused }
+
+/** What voice mode is doing, for its screen. */
+data class VoiceState(
+    val phase: VoicePhase,
+    /** Microphone loudness, 0 to 1, while listening. */
+    val level: Float = 0f,
+    /** What the user said (or what's recognised so far). */
+    val heard: String = "",
+    /** What's being read aloud. */
+    val reply: String = "",
+    /** Why it paused, when it did. */
+    val notice: String? = null,
+    /** When this phase began, for the timer on screen. Level and caption updates keep it. */
+    val since: Long = System.currentTimeMillis()
+)
+
 /** Something a skill needs the screen to do, since only it can start other apps. */
 sealed interface SkillEffect {
     data class AddToCalendar(val title: String, val triggerAt: Long) : SkillEffect
     /** Open [target]'s app with [text] ready to send (to [phone]'s chat, for WhatsApp). */
     data class SendToApp(val target: ShareTarget, val text: String, val phone: String?) : SkillEffect
 }
-
-/** What sending a message in the chat produces. */
-enum class ChatMode { Text, Image }
 
 /** Paints images for the chat; implemented by the image studio's engine. */
 interface ChatImageGenerator {
@@ -112,8 +135,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         /** Marks a user message whose skill was picked automatically (stored as its skill arg). */
         const val AUTO_SKILL = "auto"
+        /** Voice mode stops listening after this long in one turn. */
+        const val VOICE_LISTEN_LIMIT_MS = 3 * 60_000L
+        /** Voice mode gives up on a reply that takes longer than this. */
+        const val VOICE_THINK_LIMIT_MS = 5 * 60_000L
+        /** A reply with nothing new for this long is treated as stuck. Long, since a slow phone can take a while to start. */
+        const val VOICE_STALL_MS = 90_000L
+        /** Voice mode pauses after this many problems in a row instead of apologising again. */
+        const val VOICE_MAX_TROUBLES = 3
         private const val TAG = "ChatViewModel"
         private const val CONTEXT_LENGTH = 2048
+        /** Room for document excerpts: about 750 tokens, a little over a third of the context. */
+        private const val MAX_DOCUMENT_CHARS = 2_600
         private const val CHARS_PER_TOKEN = 3.5
         // Largest model file, as a share of total device RAM, that we'll try to load.
         private const val MAX_MODEL_RAM_FRACTION = 0.6
@@ -134,19 +167,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Notifications scheduled by the "Schedule a notification" skill. */
     val reminders = app.reminders
 
+    /** Listening and speaking, for voice mode and the read-aloud button. */
+    val speech = app.speech
+    private val _voice = MutableStateFlow<VoiceState?>(null)
+    /** Hands-free voice conversation; null when it's off. */
+    val voice: StateFlow<VoiceState?> = _voice.asStateFlow()
+    private var voiceJob: Job? = null
+    private val _speakingMessageId = MutableStateFlow<Long?>(null)
+    /** The reply being read aloud by its speaker button, if any. */
+    val speakingMessageId: StateFlow<Long?> = _speakingMessageId.asStateFlow()
+    private var readAloudJob: Job? = null
+
     private val _skillEffects = MutableSharedFlow<SkillEffect>(extraBufferCapacity = 4)
     val skillEffects: SharedFlow<SkillEffect> = _skillEffects.asSharedFlow()
-    // A skill's own work before (or instead of) the model answering, such as a Wikipedia lookup.
-    private var skillJob: Job? = null
 
     /** Downloaded chat models and in-progress downloads, for the Models screen. */
     val installedTextModels = textModels.installed
     val textDownloads = textModels.downloads
 
-    private val _chatMode = MutableStateFlow(ChatMode.entries.getOrNull(preferences.chatMode) ?: ChatMode.Text)
-    val chatMode: StateFlow<ChatMode> = _chatMode.asStateFlow()
+    private val documents = app.documents
+    /** Whether the user has documents chat can search (and the model to search them). */
+    val documentsSearchable: StateFlow<Boolean> = documents.searchable
+    private val _useDocuments = MutableStateFlow(true)
+    /** Whether the open conversation searches the user's documents; on by default. */
+    val useDocuments: StateFlow<Boolean> = _useDocuments.asStateFlow()
+    private val _excludedDocuments = MutableStateFlow<Set<Long>>(emptySet())
+    /** Documents the user unselected for the open conversation. */
+    val excludedDocuments: StateFlow<Set<Long>> = _excludedDocuments.asStateFlow()
+    // Looking up the user's documents before the model starts answering.
+    private var retrievalJob: Job? = null
 
-    /** Set by the activity: makes images when the chat is in image mode. */
+    /** Set by the activity: makes images when a message asks for one. */
     var imageGenerator: ChatImageGenerator? = null
     private var imageJob: Job? = null
 
@@ -180,7 +231,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * A conversation on screen. [dbId] stays null until its first message is saved, so empty
      * "new chats" never clutter the history.
      */
-    private class Session(val personaId: String, var dbId: Long? = null, var messages: List<ChatMessage> = emptyList())
+    private class Session(
+        val personaId: String,
+        var dbId: Long? = null,
+        var messages: List<ChatMessage> = emptyList(),
+        var useDocuments: Boolean = true,
+        /** Documents unselected in this chat. Unlisted ones are used, so new documents start selected. */
+        var excludedDocuments: Set<Long> = emptySet()
+    )
 
     // The open conversation for each persona, so switching personas doesn't lose your place.
     private val sessions = mutableMapOf<String, Session>()
@@ -341,7 +399,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             persist {
                 val id = session.dbId ?: return@persist
-                val stored = SkillTag.encode(message.skillId, message.skillArg, message.text)
+                val stored = SourcesTag.encode(message.sources, SkillTag.encode(message.skillId, message.skillArg, message.text))
                 history.addMessage(id, StoredMessage(false, stored, message.createdAt, message.thinkingMillis))
             }
         }
@@ -510,27 +568,266 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // region Chat
 
-    fun setChatMode(mode: ChatMode) {
-        _chatMode.value = mode
-        preferences.setChatMode(mode.ordinal)
-    }
-
     fun setSkillEnabled(id: String, enabled: Boolean) = preferences.setSkillEnabled(id, enabled)
 
     fun cancelNotification(id: Int) = reminders.cancel(id)
 
+    // region Voice
+
     /**
-     * Sends [userText] as a chat message or an image request, depending on the mode. With a
-     * [skill], the skill decides what happens to it instead.
+     * Starts hands-free voice mode: listen, send what was heard, read the reply aloud, and listen
+     * again, until [stopVoice]. Two silences in a row pause it until the user taps.
+     */
+    fun startVoice() {
+        stopReadAloud()
+        voiceJob?.cancel()
+        _voice.value = VoiceState(VoicePhase.Listening)
+        voiceJob = viewModelScope.launch { voiceLoop() }
+    }
+
+    fun stopVoice() {
+        voiceJob?.cancel()
+        voiceJob = null
+        speech.finishListening()
+        speech.stopSpeaking()
+        _voice.value = null
+    }
+
+    /** A tap in voice mode: interrupts the voice, finishes listening, or resumes after a pause. */
+    fun voiceTap() {
+        when (_voice.value?.phase) {
+            VoicePhase.Speaking -> speech.stopSpeaking()
+            VoicePhase.Listening -> speech.finishListening()
+            VoicePhase.Paused -> startVoice()
+            else -> Unit
+        }
+    }
+
+    /** How waiting for a voice reply ended. */
+    private sealed interface VoiceReply {
+        data class Done(val message: ChatMessage) : VoiceReply
+        /** Still going at the time limit. */
+        data object TimedOut : VoiceReply
+        /** Nothing new for a long while, or no reply ever started. */
+        data object Stuck : VoiceReply
+    }
+
+    private suspend fun voiceLoop() {
+        var silences = 0
+        // Problems in a row: misheard, no answer, a jumbled answer, a stuck model.
+        var troubles = 0
+
+        /** Says sorry and listens again, or pauses after too many problems in a row. */
+        suspend fun recover(heard: String, sorry: String): Boolean {
+            troubles++
+            if (troubles >= VOICE_MAX_TROUBLES) {
+                val notice = "I'm having trouble right now. Tap to try again, or pick another chat model in the Models tab."
+                _voice.value = VoiceState(VoicePhase.Speaking, heard = heard, reply = notice)
+                speakQuietly(notice)
+                _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
+                return false
+            }
+            _voice.value = VoiceState(VoicePhase.Speaking, heard = heard, reply = sorry)
+            speakQuietly(sorry)
+            return true
+        }
+
+        while (true) {
+            _voice.value = VoiceState(VoicePhase.Listening)
+            val heard = try {
+                withTimeoutOrNull(VOICE_LISTEN_LIMIT_MS) {
+                    speech.listen(
+                        onLevel = { level -> _voice.value = _voice.value?.copy(level = level) },
+                        onPartial = { text -> _voice.value = _voice.value?.copy(heard = text) }
+                    )
+                } ?: run {
+                    speech.finishListening()
+                    _voice.value = VoiceState(VoicePhase.Paused, notice = "I stopped listening after 3 minutes. Tap to talk again.")
+                    return
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Listening failed", e)
+                _voice.value = VoiceState(VoicePhase.Paused, notice = e.message ?: "Couldn't hear you. Tap to try again.")
+                return
+            }
+            if (heard.isBlank()) {
+                silences++
+                if (silences >= 2) {
+                    _voice.value = VoiceState(VoicePhase.Paused, notice = "Tap when you're ready to talk.")
+                    return
+                }
+                continue
+            }
+            silences = 0
+
+            // Speech recognition can make words up from noise; don't send those.
+            val request = VoiceGuard.cleanTranscript(heard)
+            if (request == null) {
+                Log.i(TAG, "Voice: ignored an unclear transcript")
+                if (!recover(heard, "Sorry, I didn't catch that. Could you say it again?")) return
+                continue
+            }
+            _voice.value = VoiceState(VoicePhase.Thinking, heard = request)
+
+            // Spoken requests use skills just like typed ones: "remind me at 6pm to call mom".
+            val routeSkills = preferences.autoSkills.value || persona.value.agentic
+            val skill = if (routeSkills) SkillRouter.detect(request, preferences.enabledSkillIds.value) else null
+            if (_modelState.value !is ModelState.Ready && (skill == null || skill.needsModel)) {
+                val notice = "Load a chat model first, from the Models tab."
+                _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = notice)
+                speakQuietly(notice)
+                _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
+                return
+            }
+            val before = active.messages.size
+            send(request, skill, auto = skill != null)
+
+            val message = when (val outcome = awaitVoiceReply(before)) {
+                is VoiceReply.Done -> outcome.message
+                VoiceReply.TimedOut -> {
+                    // Still going after 5 minutes: stop it rather than keep the user waiting.
+                    stopGeneration()
+                    val notice = "Sorry, that took more than 5 minutes, so I stopped. Try a shorter question."
+                    _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = notice)
+                    speakQuietly(notice)
+                    _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
+                    return
+                }
+                VoiceReply.Stuck -> {
+                    Log.w(TAG, "Voice: the reply stalled")
+                    stopGeneration()
+                    if (!recover(request, "Sorry, I got stuck on that one. Could you ask it again?")) return
+                    continue
+                }
+            }
+
+            val spoken: String? = when {
+                message.isImage -> "Here's your picture."
+                message.isError -> null.also { Log.w(TAG, "Voice: reply failed: ${message.text}") }
+                message.skill?.isTool == true -> "Done. ${message.text}"
+                else -> when (val check = VoiceGuard.checkReply(ResponseParser.parse(message.text).answer)) {
+                    is VoiceGuard.Reply.Ok -> SpeakableText.from(check.text).ifBlank { null }
+                    VoiceGuard.Reply.Empty -> null.also { Log.w(TAG, "Voice: empty reply") }
+                    VoiceGuard.Reply.Garbled -> {
+                        Log.w(TAG, "Voice: garbled reply")
+                        if (!recover(request, "Sorry, my answer came out jumbled. Could you ask that again?")) return
+                        continue
+                    }
+                }
+            }
+            if (spoken == null) {
+                val sorry = if (message.isError) "Sorry, something went wrong with that answer. Let's try again."
+                else "Sorry, I couldn't come up with an answer. Could you ask that another way?"
+                if (!recover(request, sorry)) return
+                continue
+            }
+            troubles = 0
+            _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = spoken)
+            try {
+                speech.speak(spoken)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Speaking failed", e)
+                _voice.value = VoiceState(VoicePhase.Paused, notice = e.message ?: "Couldn't speak the reply.")
+                return
+            }
+        }
+    }
+
+    /**
+     * Waits for the reply to the message just sent, however it's made (chat, skill, picture).
+     * Gives up at the time limit, when nothing new appears for a long while, or when no reply
+     * starts at all.
+     */
+    private suspend fun awaitVoiceReply(before: Int): VoiceReply {
+        val started = System.currentTimeMillis()
+        var lastProgress: Any? = null
+        var lastChange = started
+        while (true) {
+            val messages = _messages.value
+            val last = messages.lastOrNull()
+            val generating = _isGenerating.value
+            // The user's turn and a finished reply after it.
+            if (!generating && messages.size >= before + 2 && last != null && !last.isUser && !last.isStreaming && last.imageProgress == null) {
+                return VoiceReply.Done(last)
+            }
+            val now = System.currentTimeMillis()
+            // Text growing or a picture painting both count as progress.
+            val progress = last?.let { it.text.length to it.imageProgress?.phase?.toString() }
+            if (progress != lastProgress) {
+                lastProgress = progress
+                lastChange = now
+            }
+            if (now - started > VOICE_THINK_LIMIT_MS) return VoiceReply.TimedOut
+            if (generating && now - lastChange > VOICE_STALL_MS) return VoiceReply.Stuck
+            // Nothing is being made and no reply came: the message was never answered.
+            if (!generating && now - started > 3_000 && messages.size < before + 2) return VoiceReply.Stuck
+            delay(250)
+        }
+    }
+
+    /** Reads a notice aloud; if the voice fails, the notice is still shown on screen. */
+    private suspend fun speakQuietly(text: String) {
+        try {
+            speech.speak(text)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Couldn't read a notice aloud", e)
+        }
+    }
+
+    /** What to say for a reply: its answer without markdown, or a short line for a picture or tool. */
+    private fun spokenReply(message: ChatMessage): String = when {
+        message.isImage -> "Here's your picture."
+        message.isError -> message.text
+        message.skill?.isTool == true -> "Done. ${message.text}"
+        else -> SpeakableText.from(ResponseParser.parse(message.text).answer).ifBlank { "Sorry, I don't have an answer for that." }
+    }
+
+    /** Reads one reply aloud, or stops if it's the one already being read. */
+    fun toggleReadAloud(message: ChatMessage) {
+        if (_speakingMessageId.value == message.id) {
+            stopReadAloud()
+            return
+        }
+        stopReadAloud()
+        _speakingMessageId.value = message.id
+        readAloudJob = viewModelScope.launch {
+            try {
+                speech.speak(spokenReply(message))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Read aloud failed", e)
+            } finally {
+                if (_speakingMessageId.value == message.id) _speakingMessageId.value = null
+            }
+        }
+    }
+
+    fun stopReadAloud() {
+        readAloudJob?.cancel()
+        readAloudJob = null
+        speech.stopSpeaking()
+        _speakingMessageId.value = null
+    }
+
+    // endregion
+
+    /**
+     * Sends [userText] as a chat message. With a [skill] (picked by the user or detected from the
+     * message, such as "draw a cat"), the skill decides what happens to it instead.
      */
     fun send(userText: String, skill: Skill? = null, auto: Boolean = false) {
-        if (_chatMode.value == ChatMode.Image) return requestImage(userText)
         val text = userText.trim().ifEmpty { skill?.emptyPrompt.orEmpty() }
         when (skill?.action) {
             null, SkillAction.Chat ->
                 if (skill?.share != null && _modelState.value !is ModelState.Ready) sendWithoutDraft(text, skill, auto)
                 else sendMessage(text, skill, auto)
-            SkillAction.Wikipedia -> askWikipedia(text, skill, auto)
             SkillAction.QrCode -> makeQrCode(text, skill, auto)
             SkillAction.Reminder, SkillAction.Notification -> scheduleReminder(text, skill, auto)
             SkillAction.Image -> requestImage(text, skill, auto)
@@ -588,57 +885,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun askWikipedia(text: String, skill: Skill, auto: Boolean = false) {
-        if (text.isEmpty() || _isGenerating.value || oneShot != null) return
-        val session = active
-        addUserTurn(session, text, skill, auto)
-        val placeholder = newMessage("", isUser = false, isStreaming = true).copy(skillId = skill.id)
-        updateSession(session) { it + placeholder }
-        generating = session
-        _isGenerating.value = true
-
-        fun updatePlaceholder(transform: (ChatMessage) -> ChatMessage?) = updateSession(session) { current ->
-            current.mapNotNull { if (it.id == placeholder.id) transform(it) else it }
-        }
-
-        skillJob = viewModelScope.launch {
-            val article = try {
-                Wikipedia.lookup(text)
-            } catch (e: CancellationException) {
-                updatePlaceholder { null }
-                endTurn(session)
-                throw e
-            } catch (e: Exception) {
-                Log.w(TAG, "Wikipedia lookup failed", e)
-                val reason = (e as? Wikipedia.LookupException)?.message
-                    ?: "Couldn't reach Wikipedia. Check your internet connection and try again."
-                updatePlaceholder { it.copy(text = reason, isStreaming = false, isError = true) }
-                endTurn(session)
-                return@launch
-            } finally {
-                skillJob = null
-            }
-            val source = "${article.title}\n${article.url}"
-            if (_modelState.value is ModelState.Ready && oneShot == null && generating === session) {
-                // The model answers in the persona's voice, grounded in the article.
-                updatePlaceholder { it.copy(skillArg = source) }
-                val grounding = "Skill: Query Wikipedia. Answer the user's last question using only the Wikipedia " +
-                    "extract below. If it doesn't hold the answer, say so briefly and share what the article does say.\n\n" +
-                    "Wikipedia article \"${article.title}\":\n${article.extract}"
-                startPrediction(buildPrompt(persona.value, session.messages, grounding))
-            } else {
-                // No chat model loaded: the article's introduction is the answer.
-                var reply: ChatMessage? = null
-                updatePlaceholder {
-                    it.copy(text = "**${article.title}**\n\n${article.extract}", isStreaming = false, skillArg = source)
-                        .also { done -> reply = done }
-                }
-                endTurn(session)
-                reply?.let { persistReply(session, it) }
-            }
-        }
-    }
-
     /** With no chat model to draft it, a sharing skill sends the typed text to its app as it is. */
     private fun sendWithoutDraft(text: String, skill: Skill, auto: Boolean = false) {
         val target = skill.share ?: return
@@ -686,8 +932,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Paints [userText] with the image model: from image mode, or from chat through the image
-     * skill. An [auto] request paints just its subject ("draw a cat in space" → "a cat in space").
+     * Paints [userText] with the image model, through the image skill.
+     * An [auto] request paints just its subject ("draw a cat in space" → "a cat in space").
      */
     private fun requestImage(userText: String, skill: Skill? = null, auto: Boolean = false) {
         val text = userText.trim()
@@ -748,6 +994,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val session = active
         addUserTurn(session, text, skill, auto)
+        if (skill == null && session.useDocuments && documents.searchable.value) return answerFromDocuments(session, text)
         val prompt = buildPrompt(persona.value, session.messages, skill?.instruction?.takeIf { it.isNotBlank() })
         // For WhatsApp, a number in the request says whose chat the draft should open in.
         val phone = if (skill?.share == ShareTarget.WhatsApp) PhoneNumbers.find(text) else null
@@ -763,12 +1010,52 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         startPrediction(prompt)
     }
 
+    /**
+     * Looks the message up in the user's documents, then answers with the best passages in the
+     * prompt. With no close match it's an ordinary reply; the search adds a fraction of a second.
+     */
+    private fun answerFromDocuments(session: Session, text: String) {
+        val placeholder = newMessage("", isUser = false, isStreaming = true)
+        updateSession(session) { it + placeholder }
+        generating = session
+        _isGenerating.value = true
+        if (preferences.autoMemory.value) learnFrom(text)
+        // The user turn and the placeholder are the last two; the one before is the previous question.
+        val previous = session.messages.dropLast(2).lastOrNull { it.isUser }?.text
+
+        retrievalJob = viewModelScope.launch {
+            val hits = try {
+                documents.search(DocumentContext.query(text, previous), excluded = session.excludedDocuments)
+            } catch (e: CancellationException) {
+                updateSession(session) { current -> current.filterNot { it.id == placeholder.id } }
+                endTurn(session)
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Document search failed; answering without it", e)
+                emptyList()
+            } finally {
+                retrievalJob = null
+            }
+            if (generating !== session || _modelState.value !is ModelState.Ready) {
+                updateSession(session) { current -> current.filterNot { it.id == placeholder.id } }
+                endTurn(session)
+                return@launch
+            }
+            val grounding = DocumentContext.format(hits, MAX_DOCUMENT_CHARS)
+            if (grounding != null) {
+                val sources = DocumentContext.sources(grounding.second)
+                updateSession(session) { current -> current.map { if (it.id == placeholder.id) it.copy(sources = sources) else it } }
+            }
+            startPrediction(buildPrompt(persona.value, session.messages, grounding?.first))
+        }
+    }
+
     fun stopGeneration() {
         imageJob?.let {
             it.cancel()
             return
         }
-        skillJob?.let {
+        retrievalJob?.let {
             it.cancel()
             return
         }
@@ -800,6 +1087,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             show(session)
             preferences.selectPersona(conversation.personaId)
         }
+    }
+
+    private val _draft = MutableStateFlow<String?>(null)
+    /** Text to put in the chat's input field, such as a check-in's follow-up prompt. */
+    val draft: StateFlow<String?> = _draft.asStateFlow()
+
+    /** Opened from a check-in: back to the conversation it was about, with its prompt ready to send. */
+    fun openFromCheckIn(conversationId: Long, draft: String?) {
+        if (conversationId > 0) openConversation(conversationId)
+        _draft.value = draft?.takeIf { it.isNotBlank() }
+    }
+
+    fun consumeDraft() {
+        _draft.value = null
     }
 
     fun deleteConversation(conversationId: Long) {
@@ -847,8 +1148,39 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** The chat-wide switch: on selects every document again, off unselects them all. */
+    fun setUseDocuments(enabled: Boolean) {
+        active.useDocuments = enabled
+        _useDocuments.value = enabled
+        if (enabled) {
+            active.excludedDocuments = emptySet()
+            _excludedDocuments.value = emptySet()
+        }
+    }
+
+    /** Selects or unselects one document for this chat. */
+    fun toggleDocument(id: Long, readyIds: Set<Long>) {
+        val session = active
+        if (!session.useDocuments) {
+            // Picking one document while all are off uses just that one.
+            session.useDocuments = true
+            session.excludedDocuments = readyIds - id
+        } else {
+            session.excludedDocuments = if (id in session.excludedDocuments) session.excludedDocuments - id else session.excludedDocuments + id
+            // Unselecting the last one is the same as switching documents off.
+            if (readyIds.isNotEmpty() && readyIds.all { it in session.excludedDocuments }) {
+                session.useDocuments = false
+                session.excludedDocuments = emptySet()
+            }
+        }
+        _useDocuments.value = session.useDocuments
+        _excludedDocuments.value = session.excludedDocuments
+    }
+
     private fun show(session: Session) {
         active = session
+        _useDocuments.value = session.useDocuments
+        _excludedDocuments.value = session.excludedDocuments
         _messages.value = session.messages
         _activeConversationId.value = session.dbId
     }
@@ -861,7 +1193,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun toChatMessage(stored: StoredMessage): ChatMessage {
-        val decoded = SkillTag.decode(stored.text)
+        val withSources = SourcesTag.decode(stored.text)
+        val decoded = SkillTag.decode(withSources.text)
         return ChatMessage(
             nextMessageId++,
             decoded.text,
@@ -872,7 +1205,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             imageWidth = stored.imageWidth,
             imageHeight = stored.imageHeight,
             skillId = decoded.skillId,
-            skillArg = decoded.arg
+            skillArg = decoded.arg,
+            sources = withSources.sources
         )
     }
 
@@ -968,6 +1302,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val memoryContext = if (preferences.useMemory.value) MemoryRepository.formatForPrompt(memories.value) else null
         val system = buildString {
             append(persona.fullSystemPrompt(preferences.userName.value, wordLimit))
+            if (persona.agentic && skillInstruction == null) {
+                val skills = BuiltInSkills.all.filter { it.id in preferences.enabledSkillIds.value }
+                if (skills.isNotEmpty()) {
+                    append("\n\nThis app can also act for the user with these skills, which run on their own ")
+                    append("when the user asks plainly (for example \"make a QR code for…\" or \"remind me at 6pm to…\"): ")
+                    append(skills.joinToString("; ") { "${it.name}: ${it.description}" })
+                    append(". When one of these would help, suggest it in one short line with the exact words to ask. ")
+                    append("Never pretend you already did an action yourself.")
+                }
+            }
             if (memoryContext != null) {
                 append("\n\nWhat you remember about the user from past conversations ")
                 append("(use it naturally when relevant; never recite the list):\n")
@@ -1034,6 +1378,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // endregion
 
     override fun onCleared() {
+        stopVoice()
+        stopReadAloud()
         super.onCleared()
         try {
             llamaHelper.release()

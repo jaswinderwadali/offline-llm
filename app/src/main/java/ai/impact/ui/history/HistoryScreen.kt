@@ -2,6 +2,7 @@ package ai.impact.ui.history
 
 import ai.impact.data.skills.BuiltInSkills
 import ai.impact.data.skills.SkillTag
+import ai.impact.data.documents.SourcesTag
 import ai.impact.data.Persona
 import ai.impact.data.ResponseParser
 import ai.impact.data.history.ConversationSummary
@@ -317,7 +318,7 @@ private fun EmptyHistory(modifier: Modifier) {
 /** One-line plain-text preview: drops reasoning blocks and markdown symbols. */
 internal fun previewOf(text: String?): String {
     if (text.isNullOrBlank()) return "No messages"
-    val decoded = SkillTag.decode(text)
+    val decoded = SkillTag.decode(SourcesTag.decode(text).text)
     // A skill reply shows what it was: "QR code: …", "Reminder: …".
     val skillLabel = decoded.skillId?.let { BuiltInSkills.byId(it)?.takeIf { s -> s.isTool }?.name }
     if (skillLabel != null) return "$skillLabel: ${decoded.text.trim()}"
@@ -330,7 +331,7 @@ internal fun previewOf(text: String?): String {
         .trim()
 }
 
-private fun relativeTime(time: Long): String {
+internal fun relativeTime(time: Long): String {
     val now = System.currentTimeMillis()
     if (now - time < DateUtils.MINUTE_IN_MILLIS) return "Just now"
     return DateUtils.getRelativeTimeSpanString(time, now, DateUtils.MINUTE_IN_MILLIS, DateUtils.FORMAT_ABBREV_RELATIVE).toString()

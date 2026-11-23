@@ -2,9 +2,25 @@ package ai.impact.data
 
 object BuiltInPersonas {
 
-    const val DEFAULT_ID = "friend"
+    const val DEFAULT_ID = "assistant"
 
     val all: List<Persona> = listOf(
+        Persona(
+            id = "assistant",
+            name = "Assistant",
+            emoji = "✨",
+            tagline = "Ask anything, get things done",
+            description = "A capable all-rounder. Answers any question and uses your skills to act: QR codes, reminders, posts, pictures and more.",
+            systemPrompt = "You are a knowledgeable, capable general-purpose assistant. Answer any question on any topic " +
+                "clearly and accurately: facts, explanations, advice, writing, maths, code, planning and everyday tasks. " +
+                "Lead with the answer, then add only the detail that helps. Use short lists or steps when they make things clearer. " +
+                "If a request is ambiguous, make a sensible assumption and say so briefly rather than asking many questions. " +
+                "If you are unsure or something may be out of date, say so honestly instead of guessing.",
+            colorStart = 0xFF7C5CFF, colorEnd = 0xFF4F9DFF,
+            category = PersonaCategory.General,
+            starters = listOf("Explain how vaccines work", "Remind me at 6pm to call mom", "Make a QR code for example.com"),
+            agentic = true
+        ),
         Persona(
             id = "friend",
             name = "Best Friend",

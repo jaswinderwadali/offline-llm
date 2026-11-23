@@ -28,10 +28,6 @@ object SkillRouter {
     private val notify = rx("\\b(?:notify|ping|alert|nudge|buzz)\\s+me\\b|\\bnotification\\b")
     private val remind = rx("\\bremind\\s+me\\b|\\breminder\\b")
     private val calendar = rx("\\bcalendar\\b|\\bschedule\\s+(?:a|an|my)?\\s*(?:meeting|call|event|appointment)\\b|\\b(?:add|put|save)\\b.*\\b(?:event|appointment)\\b")
-    private val wikipedia = rx("\\bwiki(?:pedia)?\\b|\\blook\\s?up\\b|\\bsearch\\s+(?:for|about)\\b")
-    // A short factual question about a named thing: "Who was Ada Lovelace?", "What is Python?"
-    // Only the question words ignore case: the capital letter is what marks a name.
-    private val factual = Regex("^\\s*(?i:who|what|where|when)\\s+(?i:is|was|were|are|did)\\s+(?:(?i:the)\\s+)?[A-Z][\\w-]")
     private val learn = rx("\\bteach\\s+me\\b|\\b(?:i\\s+want\\s+to|help\\s+me|let\\s+me)\\s+learn\\b|\\blearn\\s+something\\b|\\bfun\\s+fact\\b|\\b(?:a|quick|short|mini)\\s+lesson\\b")
     // "create a picture of…", "make me an image with…", or starting with "draw"/"paint".
     private val pictureNouns = "image|picture|pic|photo|drawing|painting|illustration|artwork|art|wallpaper|portrait|logo|poster|sticker|sketch"
@@ -72,7 +68,6 @@ object SkillRouter {
                 reminderSkill(t, ::on)
             on("text_spinner") && spin.containsMatchIn(t) -> "text_spinner"
             on("learn") && learn.containsMatchIn(t) -> "learn"
-            on("wikipedia") && (wikipedia.containsMatchIn(t) || (factual.containsMatchIn(t) && t.wordCount() <= 12)) -> "wikipedia"
             else -> null
         }
         return BuiltInSkills.byId(id)
@@ -132,6 +127,4 @@ object SkillRouter {
         val rest = text.substring(match.range.last + 1).trim()
         return if (rest.isBlank()) text.trim() else rest.replaceFirstChar { it.uppercaseChar() }
     }
-
-    private fun String.wordCount() = split(Regex("\\s+")).count { it.isNotBlank() }
 }

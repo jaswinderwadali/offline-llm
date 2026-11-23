@@ -77,6 +77,9 @@ class ChatHistoryRepository(private val dao: ChatHistoryDao) {
             StoredMessage(it.isUser, it.text, it.createdAt, it.thinkingMillis, it.imageId, it.imageWidth, it.imageHeight)
         }
 
+    suspend fun recentUserMessages(since: Long, limit: Int = 40): List<RecentUserMessage> =
+        dao.recentUserMessages(since, limit)
+
     suspend fun delete(conversationId: Long) = dao.deleteConversation(conversationId)
 
     suspend fun deleteForPersona(personaId: String) = dao.deleteForPersona(personaId)

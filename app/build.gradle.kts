@@ -33,8 +33,8 @@ android {
         minSdk = 24
         targetSdk = 36
         // CI passes -PversionCode=<run number> so every Play upload gets a unique, increasing code.
-        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 3
-        versionName = "1.1.0"
+        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 4
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -86,6 +86,8 @@ dependencies {
 
     // QR codes for the chat's "Generate QR code" skill
     implementation(libs.zxing.core)
+    // Reads the text out of PDFs for document search, on the phone.
+    implementation(libs.pdfbox.android)
 
     // Local persistence (chat history + user memory, two separate databases)
     implementation(libs.androidx.room.runtime)

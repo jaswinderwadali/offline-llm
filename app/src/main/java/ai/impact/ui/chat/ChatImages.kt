@@ -3,7 +3,6 @@ package ai.impact.ui.chat
 import android.graphics.Bitmap
 import android.os.Build
 import ai.impact.ChatMessage
-import ai.impact.ChatMode
 import ai.impact.GenerationState
 import ai.impact.data.Persona
 import ai.impact.image.GeneratedImage
@@ -94,54 +93,6 @@ class ChatImageActions(
 
 private val BubbleShape = RoundedCornerShape(6.dp, 22.dp, 22.dp, 22.dp)
 private val MaxImageWidth = 280.dp
-
-/** Chooses whether sending makes a chat reply or an image. */
-@Composable
-internal fun ModeSwitch(
-    mode: ChatMode,
-    enabled: Boolean,
-    hasImageModel: Boolean,
-    onChange: (ChatMode) -> Unit,
-    onGetImageModel: () -> Unit
-) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
-        Row(
-            Modifier.padding(start = 12.dp, end = 12.dp, top = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            ModeChip("Chat", Icons.Outlined.ChatBubbleOutline, mode == ChatMode.Text, enabled) { onChange(ChatMode.Text) }
-            ModeChip("Image", Icons.Outlined.Image, mode == ChatMode.Image, enabled) { onChange(ChatMode.Image) }
-        }
-        AnimatedVisibility(
-            visible = mode == ChatMode.Image && !hasImageModel,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut()
-        ) {
-            Row(Modifier.padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Images need an image model on this phone.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f)
-                )
-                TextButton(onClick = onGetImageModel) { Text("Get one") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ModeChip(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
-    FilterChip(
-        selected = selected,
-        onClick = onClick,
-        enabled = enabled,
-        label = { Text(label) },
-        leadingIcon = { Icon(icon, contentDescription = null, modifier = Modifier.size(FilterChipDefaults.IconSize)) },
-        shape = RoundedCornerShape(50)
-    )
-}
 
 /**
  * An image the assistant made, sized from its stored dimensions before it decodes so the list

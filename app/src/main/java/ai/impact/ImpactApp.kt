@@ -2,6 +2,10 @@ package ai.impact
 
 import android.app.Application
 import ai.impact.data.AppPreferences
+import ai.impact.data.checkins.CheckIns
+import ai.impact.speech.SpeechManager
+import ai.impact.data.documents.DocumentLibrary
+import ai.impact.data.documents.SearchModelStore
 import ai.impact.data.history.ChatHistoryDatabase
 import ai.impact.data.history.ChatHistoryRepository
 import ai.impact.data.memory.HeuristicMemoryExtractor
@@ -33,6 +37,16 @@ class ImpactApp : Application() {
     val textModels: TextModelStore by lazy { TextModelStore(this, appScope) }
     val imageModels: ImageModelStore by lazy { ImageModelStore(this, appScope) }
     val gallery: ImageGallery by lazy { ImageGallery(this) }
+
+    /** The search model and the user's documents, searched by chat. */
+    val searchModel: SearchModelStore by lazy { SearchModelStore(this, appScope) }
+    val documents: DocumentLibrary by lazy { DocumentLibrary(this, appScope, searchModel) }
+
+    /** Listening and speaking: the phone's offline engines or downloaded models. */
+    val speech: SpeechManager by lazy { SpeechManager(this, appScope) }
+
+    /** Friendly nudges about what the user was exploring, once they've been away a while. */
+    val checkIns: CheckIns by lazy { CheckIns(this) }
 
     /** Notifications scheduled by the chat's skills. */
     val reminders: Reminders by lazy { Reminders(this) }

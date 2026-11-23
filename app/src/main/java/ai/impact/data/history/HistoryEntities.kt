@@ -53,3 +53,11 @@ data class ConversationSummary(
     @ColumnInfo(name = "messageCount") val messageCount: Int,
     @ColumnInfo(name = "lastMessage") val lastMessage: String?
 )
+
+/** One of the user's own messages with the persona it was sent to. */
+data class RecentUserMessage(
+    val text: String,
+    val conversationId: Long,
+    val personaId: String,
+    val createdAt: Long
+)

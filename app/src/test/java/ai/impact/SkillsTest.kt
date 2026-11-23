@@ -5,7 +5,6 @@ import ai.impact.data.skills.PhoneNumbers
 import ai.impact.data.skills.ShareTarget
 import ai.impact.data.skills.SkillTag
 import ai.impact.data.skills.TimeParser
-import ai.impact.data.skills.Wikipedia
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -78,11 +77,11 @@ class SkillsTest {
 
     @Test
     fun skillTagRoundTrips() {
-        val stored = SkillTag.encode("wikipedia", "Ada Lovelace\nhttps://en.wikipedia.org/wiki/Ada_Lovelace", "She was a mathematician.")
+        val stored = SkillTag.encode("notify", "1764000000000;42\nsecond line & |pipes|", "Stretch")
         val decoded = SkillTag.decode(stored)
-        assertEquals("wikipedia", decoded.skillId)
-        assertEquals("Ada Lovelace\nhttps://en.wikipedia.org/wiki/Ada_Lovelace", decoded.arg)
-        assertEquals("She was a mathematician.", decoded.text)
+        assertEquals("notify", decoded.skillId)
+        assertEquals("1764000000000;42\nsecond line & |pipes|", decoded.arg)
+        assertEquals("Stretch", decoded.text)
 
         val noArg = SkillTag.decode(SkillTag.encode("qr_code", null, "https://example.com"))
         assertEquals("qr_code", noArg.skillId)
@@ -129,28 +128,12 @@ class SkillsTest {
     }
 
     @Test
-    fun wikipediaSearchTerms() {
-        assertEquals("Ada Lovelace", Wikipedia.searchTerms("Who was Ada Lovelace?"))
-        assertEquals("photosynthesis", Wikipedia.searchTerms("what is photosynthesis"))
-        assertEquals("Eiffel Tower", Wikipedia.searchTerms("tell me about the Eiffel Tower"))
-        assertEquals("Mount Everest", Wikipedia.searchTerms("Mount Everest"))
-        assertEquals("Eiffel Tower", Wikipedia.searchTerms("look up the Eiffel Tower on Wikipedia"))
-        assertEquals("black holes", Wikipedia.searchTerms("search wikipedia for black holes"))
-    }
-
-    @Test
-    fun wikipediaParsesFirstPage() {
-        val json = """
-            {"batchcomplete":true,"query":{"pages":[{"pageid":974,"ns":0,"title":"Ada Lovelace","index":1,
-            "extract":"Augusta Ada King, Countess of Lovelace was an English mathematician.",
-            "fullurl":"https://en.wikipedia.org/wiki/Ada_Lovelace"}]}}
-        """.trimIndent()
-        val article = Wikipedia.parse(json)
-        assertNotNull(article)
-        assertEquals("Ada Lovelace", article!!.title)
-        assertEquals("https://en.wikipedia.org/wiki/Ada_Lovelace", article.url)
-        assertTrue(article.extract.startsWith("Augusta Ada King"))
-
-        assertNull(Wikipedia.parse("""{"batchcomplete":true}"""))
+    fun noSkillNeedsTheInternet() {
+        // Everything runs on the phone; the removed Wikipedia skill was the only online one.
+        assertNull(BuiltInSkills.byId("wikipedia"))
+        // Old chats that used it still load, as plain messages.
+        val old = SkillTag.decode(SkillTag.encode("wikipedia", "Ada Lovelace\nhttps://example.org", "She was a mathematician."))
+        assertNull(BuiltInSkills.byId(old.skillId))
+        assertEquals("She was a mathematician.", old.text)
     }
 }

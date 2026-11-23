@@ -30,7 +30,6 @@ class AppPreferences(context: Context) {
         private const val KEY_THEME = "theme_mode"
         private const val KEY_USE_MEMORY = "use_memory"
         private const val KEY_AUTO_MEMORY = "auto_memory"
-        private const val KEY_CHAT_MODE = "chat_mode"
         private const val KEY_ENABLED_SKILLS = "enabled_skills"
         private const val KEY_AUTO_SKILLS = "auto_skills"
         /** Every skill the app has offered so far, so a skill added in an update can start enabled. */
@@ -100,7 +99,8 @@ class AppPreferences(context: Context) {
             prefs.edit().putString(KEY_KNOWN_SKILLS, allIds.joinToString(",")).apply()
             return BuiltInSkills.defaultEnabledIds
         }
-        val saved = raw.split(',').filter { it.isNotBlank() }.toSet()
+        // Skills since removed (like the online Wikipedia lookup) simply drop out.
+        val saved = raw.split(',').filter { it in allIds }.toSet()
         // Skills added in an update start in their default state; ones the user has seen keep their choice.
         // Before this list was kept, everything in the first release's catalog had been seen.
         val known = prefs.getString(KEY_KNOWN_SKILLS, null)?.split(',')?.toSet() ?: (allIds - "image")
@@ -112,13 +112,6 @@ class AppPreferences(context: Context) {
                 .apply()
         }
         return saved + added
-    }
-
-    /** Whether the chat makes text or images (a ChatMode ordinal). */
-    val chatMode: Int get() = prefs.getInt(KEY_CHAT_MODE, 0)
-
-    fun setChatMode(mode: Int) {
-        prefs.edit().putInt(KEY_CHAT_MODE, mode).apply()
     }
 
     val modelUri: String? get() = prefs.getString(KEY_MODEL_URI, null)

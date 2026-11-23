@@ -18,7 +18,13 @@ data class Persona(
     val colorEnd: Long,
     val category: PersonaCategory = PersonaCategory.Custom,
     val starters: List<String> = emptyList(),
-    val isCustom: Boolean = false
+    val isCustom: Boolean = false,
+    /**
+     * Agentic personas act, not just talk: enabled skills are picked automatically for any
+     * message that clearly asks for one, even with "Use skills automatically" switched off,
+     * and the model is told which skills it has so it can offer them.
+     */
+    val agentic: Boolean = false
 ) {
     /** Persona prompt combined with app-wide guardrails that every persona follows. */
     fun fullSystemPrompt(userName: String?, wordLimit: Int): String = buildString {
@@ -69,6 +75,7 @@ data class Persona(
 }
 
 enum class PersonaCategory(val label: String) {
+    General("General"),
     Wellbeing("Wellbeing"),
     Growth("Growth"),
     Social("Social"),
