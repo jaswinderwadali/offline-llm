@@ -1,8 +1,12 @@
 package ai.impact.image
 
 import android.net.Uri
+import ai.impact.models.AuxKind
+import ai.impact.models.AuxLayout
+import ai.impact.models.AuxSource
 import ai.impact.models.DownloadFile
 import ai.impact.models.DownloadSpec
+import ai.impact.models.auxDownloadSpec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -53,7 +57,53 @@ data class HubCandidate(val repo: String, val revision: String, val root: String
 }
 
 /** Which kind of model a Hugging Face search or download is for. */
-enum class ModelKind { Chat, Image }
+enum class ModelKind(val aux: AuxKind? = null) {
+    Chat, Image, Search(AuxKind.Search), Listen(AuxKind.Listen), Speak(AuxKind.Speak)
+}
+
+/** One downloadable version of a search, speech-to-text or voice model in a repo. */
+data class AuxOption(
+    val repo: String,
+    val revision: String,
+    val kind: AuxKind,
+    val label: String,
+    /** (path in the repo, size, name it's saved as). */
+    val files: List<Triple<String, Long, String>>
+) {
+    val sizeBytes: Long get() = files.sumOf { it.second }
+    val name: String get() = repo.substringAfter('/')
+
+    /**
+     * Stable per repo and version, so downloading it twice replaces it rather than duplicating.
+     * It starts with [idPrefix], so a download in progress can be shown under the right kind.
+     */
+    val id: String
+        get() {
+            val raw = "$repo/${files.first().first}".lowercase()
+            val slug = name.lowercase().replace(Regex("[^a-z0-9.-]+"), "_").take(50)
+            return "${idPrefix(kind)}$slug-${Integer.toHexString(raw.hashCode())}"
+        }
+
+    companion object {
+        fun idPrefix(kind: AuxKind) = "hf-${kind.name.lowercase()}-"
+    }
+
+    fun toDownloadSpec(): DownloadSpec {
+        val downloads = files.map { (path, size, saveAs) ->
+            val builder = Uri.Builder().scheme("https").authority("huggingface.co")
+            repo.split('/').forEach { builder.appendPath(it) }
+            builder.appendPath("resolve").appendPath(revision)
+            path.split('/').filter { it.isNotEmpty() }.forEach { builder.appendPath(it) }
+            DownloadFile(builder.build().toString(), saveAs, size)
+        }
+        return auxDownloadSpec(id, name, kind, AuxSource.HuggingFace, repo, downloads)
+    }
+}
+
+sealed interface AuxResolution {
+    data class Found(val repo: String, val options: List<AuxOption>) : AuxResolution
+    data class Unsupported(val repo: String, val reason: String) : AuxResolution
+}
 
 /** A single-file GGUF chat model in a repo (one quantisation). */
 data class GgufFile(val repo: String, val revision: String, val path: String, val size: Long) {
@@ -197,6 +247,34 @@ object HubParsing {
         return GgufResolution.Unsupported(ref.repo, reason)
     }
 
+    /**
+     * The downloadable versions of a [kind] model in the repo, smallest first. [configProblem] is
+     * why its config says it can't run here, if anything.
+     */
+    fun auxOptions(kind: AuxKind, ref: RepoRef, files: List<HubFile>, configProblem: String?): AuxResolution {
+        if (configProblem != null) return AuxResolution.Unsupported(ref.repo, configProblem)
+        val inFolder = files.filter { ref.subPath.isEmpty() || it.path.startsWith(ref.subPath) }
+            .map { HubFile(it.path.removePrefix(ref.subPath), it.size) }
+        val sizes = inFolder.associate { it.path to it.size }
+        val variants = AuxLayout.variants(kind, sizes.keys)
+        if (variants.isEmpty()) {
+            val names = files.map { it.path.lowercase() }
+            val reason = when {
+                names.any { it.endsWith(".gguf") } -> "This repo has GGUF files, which are chat models. Get those from the Chat tab."
+                names.none { it.endsWith(".onnx") } ->
+                    "This model isn't converted to ONNX. Search for an ONNX version of it (its name plus \"onnx\"), e.g. from Xenova or onnx-community."
+                else -> AuxLayout.importHint(kind).replace("That folder", "This repo")
+            }
+            return AuxResolution.Unsupported(ref.repo, reason)
+        }
+        // Repos often hold several near-identical 8-bit exports; offer one of each kind, smallest first.
+        val options = variants
+            .map { v -> AuxOption(ref.repo, ref.revision, kind, v.label, v.files.map { (path, saveAs) -> Triple(ref.subPath + path, sizes.getValue(path), saveAs) }) }
+            .distinctBy { it.label }
+            .sortedBy { it.sizeBytes }
+        return AuxResolution.Found(ref.repo, options)
+    }
+
     fun findCandidates(ref: RepoRef, files: List<HubFile>): HubResolution {
         val paths = files.associateBy { it.path }
         var roots = files.map { it.path }
@@ -272,6 +350,18 @@ class HuggingFaceClient {
                     // Phones can't run much past 4B parameters, so don't show the 27B giants.
                     add("num_parameters" to "min:0,max:4B")
                 }
+                ModelKind.Search -> {
+                    add("filter" to "onnx")
+                    add("pipeline_tag" to "feature-extraction")
+                }
+                ModelKind.Listen -> {
+                    add("filter" to "onnx")
+                    add("pipeline_tag" to "automatic-speech-recognition")
+                }
+                ModelKind.Speak -> {
+                    add("filter" to "onnx")
+                    add("pipeline_tag" to "text-to-speech")
+                }
             }
             if (query.isNotBlank()) add("search" to query.trim())
             add("sort" to "downloads")
@@ -283,7 +373,11 @@ class HuggingFaceClient {
         List(array.length()) { i ->
             val m = array.getJSONObject(i)
             val id = m.getString("id")
-            val reason = if (kind == ModelKind.Image) HubParsing.unsupportedReason(id) else HubParsing.chatUnsupportedReason(id)
+            val reason = when (kind) {
+                ModelKind.Image -> HubParsing.unsupportedReason(id)
+                ModelKind.Chat -> HubParsing.chatUnsupportedReason(id)
+                else -> AuxLayout.nameHint(kind.aux!!, id)
+            }
             HubModel(id, m.optLong("downloads"), m.optLong("likes"), reason)
         }
     }
@@ -296,6 +390,19 @@ class HuggingFaceClient {
     suspend fun resolveGguf(ref: RepoRef): GgufResolution = withContext(Dispatchers.IO) {
         accessProblem(ref)?.let { return@withContext GgufResolution.Unsupported(ref.repo, it) }
         HubParsing.ggufFiles(ref, listFiles(ref))
+    }
+
+    suspend fun resolveAux(ref: RepoRef, kind: AuxKind): AuxResolution = withContext(Dispatchers.IO) {
+        accessProblem(ref)?.let { return@withContext AuxResolution.Unsupported(ref.repo, it) }
+        val files = listFiles(ref)
+        // The engines are model-specific, so check what the repo says it is before offering it.
+        fun json(name: String): JSONObject? {
+            val path = ref.subPath + name
+            if (files.none { it.path == path }) return null
+            val url = "https://huggingface.co/${ref.repo}/resolve/${URLEncoder.encode(ref.revision, "UTF-8")}/$path"
+            return runCatching { JSONObject(get(url).body) }.getOrNull()
+        }
+        HubParsing.auxOptions(kind, ref, files, AuxLayout.configProblem(kind, json("config.json"), json("tokenizer_config.json")))
     }
 
     /** Why the repo's files can't be downloaded without an account, or null if they can. */

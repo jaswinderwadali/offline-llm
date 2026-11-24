@@ -36,9 +36,12 @@ object ReplyLimiter {
 
     /**
      * Returns [raw] trimmed to fit [limit] words once its visible answer has gone past it, or
-     * null while it still fits. Reasoning inside think tags never counts.
+     * null while it still fits. Reasoning inside think tags never counts. When the model [mayThink],
+     * text before any tag may be reasoning (some models open with it untagged), so nothing is cut
+     * until the closing tag shows where the answer starts.
      */
-    fun clip(raw: String, limit: Int): String? {
+    fun clip(raw: String, limit: Int, mayThink: Boolean = false): String? {
+        if (mayThink && !closeTag.containsMatchIn(raw)) return null
         val answerStart = answerStart(raw) ?: return null
         val answer = raw.substring(answerStart)
         val words = word.findAll(answer).toList()

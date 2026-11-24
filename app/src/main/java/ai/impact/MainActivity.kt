@@ -1,6 +1,10 @@
 package ai.impact
 
-import ai.impact.speech.SpeechKind
+import ai.impact.models.AuxKind
+import ai.impact.models.AuxModelStore
+import ai.impact.image.AuxOption
+import ai.impact.ui.models.AuxModelsUi
+import ai.impact.ui.models.BuiltInEngine
 import ai.impact.speech.SpeechManager
 import ai.impact.speech.SpeechCatalog
 import ai.impact.ui.models.CatalogOption
@@ -121,6 +125,29 @@ class MainActivity : ComponentActivity() {
         uri?.let(imageViewModel::importModel)
     }
 
+    /** Which kind of search or speech model the open folder picker is for. */
+    private var pendingImportKind: AuxKind? = null
+    private val auxMessages = MutableSharedFlow<String>(extraBufferCapacity = 4)
+
+    private val auxModelFolderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val kind = pendingImportKind ?: return@registerForActivityResult
+        pendingImportKind = null
+        if (uri != null) auxStore(kind).startImport(uri, kind) { error -> auxMessages.tryEmit(error ?: "Model imported") }
+    }
+
+    private fun importAuxModel(kind: AuxKind) {
+        pendingImportKind = kind
+        auxModelFolderPicker.launch(null)
+    }
+
+    private fun auxStore(kind: AuxKind): AuxModelStore = if (kind == AuxKind.Search) searchModel.store else speech.models
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // The picker can outlive a rotation; remember what it was opened for.
+        pendingImportKind?.let { outState.putString(KEY_IMPORT_KIND, it.name) }
+    }
+
     private val modelPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(viewModel::onModelPicked)
     }
@@ -185,6 +212,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        savedInstanceState?.getString(KEY_IMPORT_KIND)?.let { name -> pendingImportKind = AuxKind.entries.firstOrNull { it.name == name } }
         enableEdgeToEdge()
         if (savedInstanceState == null) handleCheckIn(intent)
         // The chat and the image studio lend each other their models. Both view models outlive the
@@ -355,6 +383,7 @@ class MainActivity : ComponentActivity() {
                                 route = Routes.CHAT
                             },
                             onDeleteConversation = viewModel::deleteConversation,
+                            onRenameConversation = viewModel::renameConversation,
                             onSeeAllHistory = { historyReturnRoute = Routes.HOME; route = Routes.HISTORY },
                             onOpenModels = { managerReturnRoute = Routes.HOME; route = Routes.MODEL_MANAGER },
                             onCreateImage = { openImagine(Routes.HOME) },
@@ -374,6 +403,7 @@ class MainActivity : ComponentActivity() {
                                 route = Routes.CHAT
                             },
                             onDelete = viewModel::deleteConversation,
+                            onRename = viewModel::renameConversation,
                             onClearAll = viewModel::clearHistory,
                             onBack = { route = historyReturnRoute }
                         )
@@ -399,7 +429,6 @@ class MainActivity : ComponentActivity() {
                             onAdd = { documentPicker.launch(DocumentKind.pickerTypes) },
                             onRetry = documents::retry,
                             onDelete = documents::delete,
-                            onSearch = { documents.search(it, k = 3) },
                             onBack = { route = documentsReturnRoute },
                             showBack = documentsReturnRoute != Routes.HOME
                         )
@@ -468,7 +497,8 @@ class MainActivity : ComponentActivity() {
                         val imageState by imageViewModel.modelState.collectAsStateWithLifecycle()
                         val imageInstalled by imageViewModel.installed.collectAsStateWithLifecycle()
                         val selectedImageId by imageViewModel.selectedModelId.collectAsStateWithLifecycle()
-                        val searchInstalled by searchModel.installed.collectAsStateWithLifecycle()
+                        val searchModels by searchModel.models.collectAsStateWithLifecycle()
+                        val activeSearch by searchModel.active.collectAsStateWithLifecycle()
                         val searchLoaded by documents.searchModelLoaded.collectAsStateWithLifecycle()
                         val searchDownloads by searchModel.download.collectAsStateWithLifecycle()
                         val docs by documents.documents.collectAsStateWithLifecycle()
@@ -523,22 +553,21 @@ class MainActivity : ComponentActivity() {
                         val searchSlot = ModelSlot(
                             kind = ModelSlotKind.Search,
                             status = if (searchLoaded) SlotStatus.Loaded else SlotStatus.NotLoaded,
-                            activeName = if (searchInstalled) SEARCH_MODEL_LABEL else null,
-                            installed = if (searchInstalled) {
-                                listOf(ManagedModel(SearchModelStore.ID, SEARCH_MODEL_LABEL, searchModel.sizeBytes, searchLoaded))
-                            } else emptyList(),
-                            loadedBytes = if (searchLoaded) searchModel.sizeBytes else 0L,
-                            onLoad = if (searchInstalled) documents::loadSearchModel else null,
-                            onUse = { documents.loadSearchModel() },
+                            activeName = activeSearch?.name,
+                            installed = searchModels.map { ManagedModel(it.id, it.name, it.sizeBytes, it.id == activeSearch?.id) },
+                            loadedBytes = if (searchLoaded) activeSearch?.sizeBytes ?: 0L else 0L,
+                            onLoad = if (activeSearch != null) documents::loadSearchModel else null,
+                            onUse = { documents.selectSearchModel(it.id) },
                             onUnload = documents::unloadSearchModel,
                             note = when {
-                                !searchInstalled -> "Needed to ask about your documents in chat."
+                                activeSearch == null -> "Needed to ask about your documents in chat."
                                 readyDocs == 0 -> "Add documents to search them in chat."
                                 readyDocs == 1 -> "It loads by itself when chat searches your document."
                                 else -> "It loads by itself when chat searches your $readyDocs documents."
                             },
-                            moreLabel = "Manage documents",
-                            onMore = { documentsReturnRoute = Routes.MODEL_MANAGER; route = Routes.DOCUMENTS },
+                            moreLabel = "Get more search models",
+                            onMore = { openModels(ModelsTab.Search, Routes.MODEL_MANAGER) },
+                            onDelete = { documents.deleteSearchModel(it.id) },
                             download = searchDownloads[SearchModelStore.ID],
                             onDownload = {
                                 searchModel.dismissError()
@@ -554,7 +583,7 @@ class MainActivity : ComponentActivity() {
                         val listenLoaded by speech.listenLoaded.collectAsStateWithLifecycle()
                         val speakLoaded by speech.speakLoaded.collectAsStateWithLifecycle()
                         fun speechSlot(
-                            kind: SpeechKind,
+                            kind: AuxKind,
                             slotKind: ModelSlotKind,
                             engine: String,
                             loaded: Boolean,
@@ -586,7 +615,10 @@ class MainActivity : ComponentActivity() {
                                 onUnload = onUnload,
                                 canUnload = !builtIn,
                                 note = if (builtIn) builtInNote else "Loads by itself when needed. Everything stays on this phone.",
-                                catalog = SpeechCatalog.models.filter { m -> m.kind == kind && downloaded.none { it.id == m.id } }.map { m ->
+                                moreLabel = "More models, Hugging Face or import",
+                                onMore = { openModels(if (kind == AuxKind.Listen) ModelsTab.Listen else ModelsTab.Speak, Routes.MODEL_MANAGER) },
+                                // Only the recommended pick here; the full list lives on the Models screen.
+                                catalog = SpeechCatalog.models.filter { m -> m.kind == kind && m.recommended && downloaded.none { it.id == m.id } }.map { m ->
                                     CatalogOption(
                                         id = m.id, name = m.name, description = m.description, license = m.license, sizeBytes = m.sizeBytes,
                                         download = speechDownloads[m.id],
@@ -601,14 +633,14 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         val listenSlot = speechSlot(
-                            SpeechKind.Listen, ModelSlotKind.Listen, listenEngine, listenLoaded,
+                            AuxKind.Listen, ModelSlotKind.Listen, listenEngine, listenLoaded,
                             builtInName = "Phone's offline recognizer",
                             builtInReady = speech.systemListenAvailable,
                             builtInNote = "Uses your phone's own offline speech recognition. Nothing is sent online.",
                             onSelect = speech::selectListen, onLoad = speech::loadListen, onUnload = speech::unloadListen
                         )
                         val speakSlot = speechSlot(
-                            SpeechKind.Speak, ModelSlotKind.Speak, speakEngine, speakLoaded,
+                            AuxKind.Speak, ModelSlotKind.Speak, speakEngine, speakLoaded,
                             builtInName = "Phone's voice",
                             builtInReady = true,
                             builtInNote = "Uses your phone's offline voice. Change its voice and speed in your phone's text-to-speech settings.",
@@ -640,7 +672,95 @@ class MainActivity : ComponentActivity() {
                         val imageDownloads by imageViewModel.downloads.collectAsStateWithLifecycle()
                         val import by imageViewModel.import.collectAsStateWithLifecycle()
                         val selectedImageId by imageViewModel.selectedModelId.collectAsStateWithLifecycle()
-                        val messages = remember { merge(imageViewModel.messages, hubViewModel.messages) }
+                        val messages = remember { merge(imageViewModel.messages, hubViewModel.messages, auxMessages) }
+
+                        // Document search: one model at a time, chosen from those on the phone.
+                        val searchModels by searchModel.models.collectAsStateWithLifecycle()
+                        val activeSearch by searchModel.active.collectAsStateWithLifecycle()
+                        val searchLoaded by documents.searchModelLoaded.collectAsStateWithLifecycle()
+                        val searchDownloads by searchModel.download.collectAsStateWithLifecycle()
+                        val searchImport by searchModel.store.import.collectAsStateWithLifecycle()
+                        val docs by documents.documents.collectAsStateWithLifecycle()
+                        val docProgress by documents.progress.collectAsStateWithLifecycle()
+                        val readyDocs = docs.count { it.status == DocumentStatus.READY }
+                        fun toast(message: String?) { message?.let { Toast.makeText(context, it, Toast.LENGTH_LONG).show() } }
+                        val searchUi = AuxModelsUi(
+                            kind = AuxKind.Search,
+                            installed = searchModels,
+                            activeId = activeSearch?.id,
+                            loaded = searchLoaded,
+                            builtIn = null,
+                            catalog = SearchModelStore.catalog,
+                            downloads = searchDownloads,
+                            import = searchImport,
+                            note = when {
+                                docProgress.isNotEmpty() && activeSearch != null ->
+                                    "Updating ${docProgress.size} document${if (docProgress.size == 1) "" else "s"} for ${activeSearch!!.name}…"
+                                readyDocs > 0 -> "Switching models re-scores your $readyDocs document${if (readyDocs == 1) "" else "s"} on the phone. Nothing is uploaded."
+                                else -> null
+                            },
+                            onDownload = { m -> searchModel.store.dismissError(m.id); toast(searchModel.store.startDownload(m)) },
+                            onCancelDownload = searchModel.store::cancelDownload,
+                            onDismissDownloadError = searchModel.store::dismissError,
+                            onUse = documents::selectSearchModel,
+                            onLoad = documents::loadSearchModel,
+                            onUnload = documents::unloadSearchModel,
+                            onDelete = { documents.deleteSearchModel(it.id) },
+                            onImport = { importAuxModel(AuxKind.Search) },
+                            onCancelImport = searchModel.store::cancelImport
+                        )
+
+                        // Speech: the phone's own engine, or a downloaded model.
+                        val speechInstalled by speech.models.installed.collectAsStateWithLifecycle()
+                        val speechDownloads by speech.models.downloads.collectAsStateWithLifecycle()
+                        val speechImport by speech.models.import.collectAsStateWithLifecycle()
+                        val listenEngine by speech.listenEngine.collectAsStateWithLifecycle()
+                        val speakEngine by speech.speakEngine.collectAsStateWithLifecycle()
+                        val listenLoaded by speech.listenLoaded.collectAsStateWithLifecycle()
+                        val speakLoaded by speech.speakLoaded.collectAsStateWithLifecycle()
+                        fun speechUi(kind: AuxKind, engine: String, loaded: Boolean, builtIn: BuiltInEngine, onSelect: (String) -> Unit, onLoad: () -> Unit, onUnload: () -> Unit): AuxModelsUi {
+                            val catalog = SpeechCatalog.models.filter { it.kind == kind }
+                            return AuxModelsUi(
+                                kind = kind,
+                                installed = speechInstalled.filter { it.kind == kind },
+                                activeId = engine,
+                                loaded = loaded,
+                                builtIn = builtIn,
+                                catalog = catalog,
+                                // Both kinds share one store; keep each tab to its own downloads.
+                                downloads = speechDownloads.filterKeys { id -> catalog.any { it.id == id } || id.startsWith(AuxOption.idPrefix(kind)) },
+                                import = speechImport,
+                                note = null,
+                                onDownload = { m -> speech.models.dismissError(m.id); toast(speech.models.startDownload(m)) },
+                                onCancelDownload = speech.models::cancelDownload,
+                                onDismissDownloadError = speech.models::dismissError,
+                                onUse = onSelect,
+                                onLoad = onLoad,
+                                onUnload = onUnload,
+                                onDelete = { speech.delete(it.id) },
+                                onImport = { importAuxModel(kind) },
+                                onCancelImport = speech.models::cancelImport
+                            )
+                        }
+                        val listenUi = speechUi(
+                            AuxKind.Listen, listenEngine, listenLoaded,
+                            BuiltInEngine(
+                                SpeechManager.SYSTEM, "Phone's offline recognizer", speech.systemListenAvailable,
+                                unavailableReason = "This phone has no offline speech recognizer. Download a Whisper model below.",
+                                note = "Built into your phone · nothing is sent online"
+                            ),
+                            speech::selectListen, speech::loadListen, speech::unloadListen
+                        )
+                        val speakUi = speechUi(
+                            AuxKind.Speak, speakEngine, speakLoaded,
+                            BuiltInEngine(
+                                SpeechManager.SYSTEM, "Phone's voice", true,
+                                unavailableReason = "",
+                                note = "Built into your phone · change it in text-to-speech settings"
+                            ),
+                            speech::selectSpeak, speech::loadSpeak, speech::unloadSpeak
+                        )
+
                         ModelsScreen(
                             tab = modelsTab,
                             onTabChange = { modelsTab = it },
@@ -676,6 +796,9 @@ class MainActivity : ComponentActivity() {
                                 onImport = { imageModelFolderPicker.launch(null) },
                                 onCancelImport = imageViewModel::cancelImport
                             ),
+                            search = searchUi,
+                            listen = listenUi,
+                            speak = speakUi,
                             messages = messages,
                             onOpenHub = { kind ->
                                 hubViewModel.open(kind)
@@ -693,13 +816,20 @@ class MainActivity : ComponentActivity() {
                         val textDownloads by viewModel.textDownloads.collectAsStateWithLifecycle()
                         val imageInstalled by imageViewModel.installed.collectAsStateWithLifecycle()
                         val imageDownloads by imageViewModel.downloads.collectAsStateWithLifecycle()
+                        val searchModels by searchModel.models.collectAsStateWithLifecycle()
+                        val searchDownloads by searchModel.download.collectAsStateWithLifecycle()
+                        val speechInstalled by speech.models.installed.collectAsStateWithLifecycle()
+                        val speechDownloads by speech.models.downloads.collectAsStateWithLifecycle()
                         // Opened straight from a restored back stack: make sure suggestions load.
                         LaunchedEffect(Unit) { hubViewModel.open(kind) }
                         val (installed, downloads) = when (kind) {
                             ModelKind.Chat -> textInstalled.map { it.id } to textDownloads
                             ModelKind.Image -> imageInstalled.map { it.id } to imageDownloads
+                            ModelKind.Search -> searchModels.map { it.id } to searchDownloads
+                            ModelKind.Listen, ModelKind.Speak -> speechInstalled.map { it.id } to speechDownloads
                         }
-                        fun backToModels() = openModels(if (kind == ModelKind.Chat) ModelsTab.Chat else ModelsTab.Image, Routes.HUB)
+                        // Each kind has a Models tab of the same name.
+                        fun backToModels() = openModels(ModelsTab.valueOf(kind.name), Routes.HUB)
                         HuggingFaceScreen(
                             kind = kind,
                             search = search,
@@ -718,7 +848,8 @@ class MainActivity : ComponentActivity() {
                             onDismissResolve = hubViewModel::dismissResolve,
                             // Progress shows on the Models screen, next to the other downloads.
                             onDownloadImage = { if (hubViewModel.download(it)) backToModels() },
-                            onDownloadChat = { if (hubViewModel.download(it)) backToModels() }
+                            onDownloadChat = { if (hubViewModel.download(it)) backToModels() },
+                            onDownloadAux = { if (hubViewModel.download(it)) backToModels() }
                         )
                     }
 
@@ -881,8 +1012,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** How the document search model is named in the model manager. */
-private const val SEARCH_MODEL_LABEL = "all-MiniLM-L6-v2 · English"
+private const val KEY_IMPORT_KIND = "import_kind"
 
 /** The four tabs. Chat opens on top of Home, full screen. */
 @Composable

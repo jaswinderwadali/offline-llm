@@ -69,8 +69,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 
 /**
- * The user's document library: get the search model, add files, see them index, and try a
- * search to see what chat would find.
+ * The user's document library: get the search model, add files and see them index.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,7 +85,6 @@ fun DocumentsScreen(
     onAdd: () -> Unit,
     onRetry: (Long) -> Unit,
     onDelete: (Long) -> Unit,
-    onSearch: suspend (String) -> List<SearchHit>,
     onBack: () -> Unit,
     /** False when it's a tab of the main navigation, which has no back arrow. */
     showBack: Boolean = true
@@ -150,9 +148,6 @@ fun DocumentsScreen(
             }
             items(documents, key = { it.id }) { doc ->
                 DocumentRow(doc, progress[doc.id], onRetry = { onRetry(doc.id) }, onDelete = { pendingDelete = doc })
-            }
-            if (modelInstalled && documents.any { it.status == DocumentStatus.READY }) {
-                item { TrySearch(onSearch) }
             }
         }
     }
@@ -280,56 +275,3 @@ private fun subtitle(doc: DocumentEntity, kind: DocumentKind?, progress: Float?)
     ).joinToString(" · ")
 }
 
-/** Shows what chat would find for a question, so the user can see the library working. */
-@Composable
-private fun TrySearch(onSearch: suspend (String) -> List<SearchHit>) {
-    var query by rememberSaveable { mutableStateOf("") }
-    var results by remember { mutableStateOf<List<SearchHit>?>(null) }
-    var searching by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    fun run() {
-        if (query.isBlank() || searching) return
-        searching = true
-        scope.launch {
-            results = try { onSearch(query) } finally { searching = false }
-        }
-    }
-    Column(Modifier.padding(top = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Try a search", style = MaterialTheme.typography.titleSmall)
-        OutlinedTextField(
-            value = query,
-            onValueChange = { query = it },
-            modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("Ask something your documents answer") },
-            singleLine = true,
-            trailingIcon = { IconButton(onClick = ::run, enabled = !searching) { Icon(Icons.Outlined.Search, contentDescription = "Search") } },
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-            keyboardActions = KeyboardActions(onSearch = { run() })
-        )
-        results?.let { hits ->
-            if (hits.isEmpty()) {
-                Text(
-                    "Nothing close enough. Chat would answer this from general knowledge.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            hits.forEach { hit ->
-                Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row {
-                            Text(
-                                hit.source.label, style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f),
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
-                            Text("${(hit.score * 100).toInt()}% match", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        hit.heading?.let { Text(it, style = MaterialTheme.typography.labelLarge) }
-                        Text(hit.text, style = MaterialTheme.typography.bodySmall, maxLines = 5, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-            }
-        }
-    }
-}

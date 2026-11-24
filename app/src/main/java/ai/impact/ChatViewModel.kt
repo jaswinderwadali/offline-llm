@@ -141,10 +141,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val VOICE_THINK_LIMIT_MS = 5 * 60_000L
         /** A reply with nothing new for this long is treated as stuck. Long, since a slow phone can take a while to start. */
         const val VOICE_STALL_MS = 90_000L
+        /** After the voice finishes, the mic waits this long so it doesn't hear the voice's tail. */
+        const val VOICE_RESUME_PAUSE_MS = 1_000L
         /** Voice mode pauses after this many problems in a row instead of apologising again. */
         const val VOICE_MAX_TROUBLES = 3
         private const val TAG = "ChatViewModel"
-        private const val CONTEXT_LENGTH = 2048
+        /** How much of the context the prompt (persona, memories, history) may fill. */
+        private const val PROMPT_CONTEXT = 2048
+        /** Context on phones with plenty of memory: leaves a reasoning model room to think and answer. */
+        private const val LARGE_CONTEXT = 4096
+        private const val LARGE_CONTEXT_MIN_RAM = 7L * 1024 * 1024 * 1024
+        /** On a small context, kept free for a reasoning model's thinking. */
+        private const val THINKING_RESERVE_TOKENS = 700
+        /** How much of an unfinished thought is kept when asking for the answer after it. */
+        private const val THOUGHT_TAIL_CHARS = 900
+        /** File names of models that reason in <think> tags before answering. */
+        private val THINKING_MODEL_HINTS = listOf("qwen3", "deepseek-r1", "-r1-", "r1-distill", "qwq", "think", "reason", "smollm3", "magistral", "exaone-deep")
         /** Room for document excerpts: about 750 tokens, a little over a third of the context. */
         private const val MAX_DOCUMENT_CHARS = 2_600
         private const val CHARS_PER_TOKEN = 3.5
@@ -257,6 +269,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var nextMessageId = 0L
     private var promptFormat = PromptFormat.ChatML
 
+    /** The context the model is loaded with; bigger when the phone can afford it. */
+    private val contextLength: Int = run {
+        val memory = ActivityManager.MemoryInfo().also { application.getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
+        if (memory.totalMem >= LARGE_CONTEXT_MIN_RAM) LARGE_CONTEXT else PROMPT_CONTEXT
+    }
+
+    /** Whether the loaded model reasons before answering: from its name, or once it's seen doing so. */
+    @Volatile
+    private var modelThinks = false
+
+    /** The prompt of the reply being written, to ask for the answer if it stops after thinking. */
+    private var lastPrompt: String? = null
+
+    /** The reply already given a second chance, so a model that keeps failing isn't asked forever. */
+    private var continuedMessageId: Long? = null
+
     private val _llmFlow = MutableSharedFlow<LlamaHelper.LLMEvent>(extraBufferCapacity = 256)
 
     /** A single prompt run outside any chat (e.g. enhancing an image prompt); its tokens never reach the chat. */
@@ -330,7 +358,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         hitStopMarker = true
                     }
                     // The engine can't cap reply length, so stop once the answer runs past the chosen length.
-                    ReplyLimiter.clip(text, preferences.wordLimit.value)?.let { clipped ->
+                    if (!modelThinks && ResponseParser.hasThinkingTag(text)) modelThinks = true
+                    ReplyLimiter.clip(text, preferences.wordLimit.value, mayThink = modelThinks)?.let { clipped ->
                         text = clipped
                         hitStopMarker = true
                     }
@@ -343,7 +372,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     finishGeneration(session)
                 }
             }
-            is LlamaHelper.LLMEvent.Done -> finishGeneration(session)
+            is LlamaHelper.LLMEvent.Done -> if (!answerAfterThinking(session)) finishGeneration(session)
             is LlamaHelper.LLMEvent.Error -> {
                 Log.e(TAG, "LLM Error: ${event.message}")
                 updateSession(session) { current ->
@@ -376,6 +405,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             else -> Unit
         }
+    }
+
+    /**
+     * A reasoning model can stop once it's done thinking: it ran out of context mid-thought, or
+     * ended its turn without answering. Then the thought is closed and the model is asked to
+     * answer straight away, keeping the end of its reasoning, so the reply isn't left empty.
+     * Returns true when it asked (the reply keeps streaming), false to finish as usual.
+     */
+    private fun answerAfterThinking(session: Session): Boolean {
+        val reply = session.messages.lastOrNull()?.takeIf { !it.isUser && it.isStreaming } ?: return false
+        val prompt = lastPrompt ?: return false
+        val parsed = ResponseParser.parse(reply.text)
+        if (!parsed.hasThinking || parsed.answer.isNotBlank() || continuedMessageId == reply.id) return false
+        continuedMessageId = reply.id
+        val thought = parsed.thinking.orEmpty()
+        val tail = if (thought.length > THOUGHT_TAIL_CHARS) "…" + thought.takeLast(THOUGHT_TAIL_CHARS).substringAfter(' ') else thought
+        Log.i(TAG, "Reply stopped after thinking (${thought.length} chars); asking for the answer")
+        updateSession(session) { current ->
+            current.map { message ->
+                if (message.id != reply.id) return@map message
+                // Close the thought, so it shows as finished and the answer streams in below it.
+                val closed = if (parsed.isThinkingComplete) message.text.trimEnd() else message.text.trimEnd() + "\n</think>"
+                message.copy(text = "$closed\n\n", thinkingMillis = message.thinkingMillis ?: (System.currentTimeMillis() - message.createdAt))
+            }
+        }
+        startPrediction("$prompt<think>\n$tail\n</think>\n\n", remember = false)
+        return true
     }
 
     private fun finishGeneration(session: Session, userStopped: Boolean = false) {
@@ -477,6 +533,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "gemma" in lower -> PromptFormat.Gemma
             else -> PromptFormat.ChatML
         }
+        modelThinks = THINKING_MODEL_HINTS.any { it in lower }
         Log.d(TAG, "Loading $name with format $promptFormat")
 
         if (!lower.endsWith(".gguf")) {
@@ -504,7 +561,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 llamaHelper.load(
                     path = uri.toString(),
-                    contextLength = CONTEXT_LENGTH,
+                    contextLength = contextLength,
                     loaded = {
                         Log.d(TAG, "Model loaded")
                         preferences.setModelLoading(null)
@@ -579,6 +636,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * again, until [stopVoice]. Two silences in a row pause it until the user taps.
      */
     fun startVoice() {
+        voiceInterrupted = false
         stopReadAloud()
         voiceJob?.cancel()
         _voice.value = VoiceState(VoicePhase.Listening)
@@ -593,10 +651,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _voice.value = null
     }
 
+    /** Set when the user cut the voice off: they want to talk now, so listening starts at once. */
+    @Volatile
+    private var voiceInterrupted = false
+
     /** A tap in voice mode: interrupts the voice, finishes listening, or resumes after a pause. */
     fun voiceTap() {
         when (_voice.value?.phase) {
-            VoicePhase.Speaking -> speech.stopSpeaking()
+            VoicePhase.Speaking -> {
+                voiceInterrupted = true
+                speech.stopSpeaking()
+            }
             VoicePhase.Listening -> speech.finishListening()
             VoicePhase.Paused -> startVoice()
             else -> Unit
@@ -616,29 +681,51 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var silences = 0
         // Problems in a row: misheard, no answer, a jumbled answer, a stuck model.
         var troubles = 0
+        // Whether something was just read aloud, so the mic waits before opening.
+        var afterSpeech = false
+
+        /** Reads [text] aloud as the current reply; listening resumes a moment after it ends. */
+        suspend fun say(heard: String, text: String) {
+            _voice.value = VoiceState(VoicePhase.Speaking, heard = heard, reply = text)
+            afterSpeech = true
+            speakQuietly(text)
+        }
 
         /** Says sorry and listens again, or pauses after too many problems in a row. */
         suspend fun recover(heard: String, sorry: String): Boolean {
             troubles++
             if (troubles >= VOICE_MAX_TROUBLES) {
                 val notice = "I'm having trouble right now. Tap to try again, or pick another chat model in the Models tab."
-                _voice.value = VoiceState(VoicePhase.Speaking, heard = heard, reply = notice)
-                speakQuietly(notice)
+                say(heard, notice)
                 _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
                 return false
             }
-            _voice.value = VoiceState(VoicePhase.Speaking, heard = heard, reply = sorry)
-            speakQuietly(sorry)
+            say(heard, sorry)
             return true
         }
 
         while (true) {
+            if (afterSpeech) {
+                afterSpeech = false
+                // Let the voice and its echo die away first, or the mic hears the reply as the
+                // user's next question. A tap to interrupt means they want to talk right now.
+                _voice.value = _voice.value?.copy(level = 0f)
+                if (!voiceInterrupted) delay(VOICE_RESUME_PAUSE_MS)
+                voiceInterrupted = false
+            }
             _voice.value = VoiceState(VoicePhase.Listening)
             val heard = try {
                 withTimeoutOrNull(VOICE_LISTEN_LIMIT_MS) {
                     speech.listen(
-                        onLevel = { level -> _voice.value = _voice.value?.copy(level = level) },
-                        onPartial = { text -> _voice.value = _voice.value?.copy(heard = text) }
+                        // Only while listening: a late level or caption must not undo the next phase.
+                        onLevel = { level -> _voice.value?.takeIf { it.phase == VoicePhase.Listening }?.let { _voice.value = it.copy(level = level) } },
+                        onPartial = { text -> _voice.value?.takeIf { it.phase != VoicePhase.Speaking }?.let { _voice.value = it.copy(heard = text) } },
+                        // They've paused long enough: show thinking now, while the last words are worked out.
+                        onFinished = {
+                            _voice.value?.takeIf { it.phase == VoicePhase.Listening }?.let {
+                                _voice.value = VoiceState(VoicePhase.Thinking, heard = it.heard)
+                            }
+                        }
                     )
                 } ?: run {
                     speech.finishListening()
@@ -669,15 +756,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (!recover(heard, "Sorry, I didn't catch that. Could you say it again?")) return
                 continue
             }
-            _voice.value = VoiceState(VoicePhase.Thinking, heard = request)
+            // Keeps the thinking timer that started when they stopped talking.
+            _voice.value = (_voice.value?.takeIf { it.phase == VoicePhase.Thinking } ?: VoiceState(VoicePhase.Thinking)).copy(heard = request, level = 0f)
 
             // Spoken requests use skills just like typed ones: "remind me at 6pm to call mom".
             val routeSkills = preferences.autoSkills.value || persona.value.agentic
             val skill = if (routeSkills) SkillRouter.detect(request, preferences.enabledSkillIds.value) else null
             if (_modelState.value !is ModelState.Ready && (skill == null || skill.needsModel)) {
                 val notice = "Load a chat model first, from the Models tab."
-                _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = notice)
-                speakQuietly(notice)
+                say(request, notice)
                 _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
                 return
             }
@@ -690,8 +777,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // Still going after 5 minutes: stop it rather than keep the user waiting.
                     stopGeneration()
                     val notice = "Sorry, that took more than 5 minutes, so I stopped. Try a shorter question."
-                    _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = notice)
-                    speakQuietly(notice)
+                    say(request, notice)
                     _voice.value = VoiceState(VoicePhase.Paused, notice = notice)
                     return
                 }
@@ -725,6 +811,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             troubles = 0
             _voice.value = VoiceState(VoicePhase.Speaking, heard = request, reply = spoken)
+            afterSpeech = true
             try {
                 speech.speak(spoken)
             } catch (e: CancellationException) {
@@ -874,7 +961,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _isGenerating.value = false
     }
 
-    private fun startPrediction(prompt: String) {
+    private fun startPrediction(prompt: String, remember: Boolean = true) {
+        if (remember) lastPrompt = prompt
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 llamaHelper.predict(prompt)
@@ -1113,6 +1201,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         persist { history.delete(conversationId) }
     }
 
+    fun renameConversation(conversationId: Long, title: String) {
+        persist { history.rename(conversationId, title) }
+    }
+
     fun clearHistory() {
         stopGeneration()
         sessions.clear()
@@ -1320,7 +1412,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             if (skillInstruction != null) append("\n\nFor this reply only. ").append(skillInstruction)
         }
         val replyTokens = (wordLimit * 1.5).toInt() + 32
-        val budgetChars = ((CONTEXT_LENGTH - replyTokens) * CHARS_PER_TOKEN).toInt() - system.length
+        // A reasoning model thinks before it answers; without room for that it runs out of context
+        // mid-thought. A large context has room to spare after the capped prompt.
+        val thinkingTokens = if (modelThinks && contextLength - PROMPT_CONTEXT < THINKING_RESERVE_TOKENS) THINKING_RESERVE_TOKENS else 0
+        val promptTokens = minOf(PROMPT_CONTEXT, contextLength - replyTokens - thinkingTokens)
+        val budgetChars = (promptTokens * CHARS_PER_TOKEN).toInt() - system.length
 
         val turns = ArrayDeque<ChatMessage>()
         var used = 0

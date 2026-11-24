@@ -37,6 +37,8 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
         /** About 1,800 pages of dense text; beyond that, indexing on a phone takes too long. */
         const val MAX_CHUNKS = 4_000
         private const val EMBED_BATCH = 16
+        /** Queued instead of a document id: re-score every passage with the active search model. */
+        private const val REEMBED = -1L
     }
 
     private val appContext = context.applicationContext
@@ -60,6 +62,7 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
 
     private val embedderLock = Mutex()
     private var embedder: Embedder? = null
+    private var embedderId: String? = null
 
     private val _searchModelLoaded = MutableStateFlow(false)
     /** Whether the search model is in memory. It loads on first use, so this is about freeing RAM. */
@@ -71,7 +74,7 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
     init {
         scope.launch {
             for (id in queue) {
-                val job = scope.launch(Dispatchers.Default) { indexDocument(id) }
+                val job = scope.launch(Dispatchers.Default) { if (id == REEMBED) reembedAll() else indexDocument(id) }
                 current = id to job
                 job.join()
                 current = null
@@ -81,6 +84,13 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
         scope.launch {
             searchModel.installed.first { it }
             dao.withStatus(DocumentStatus.INDEXING).forEach { queue.send(it.id) }
+        }
+        // Whenever the active search model changes (picked, or the picked one deleted), the stored
+        // vectors were made by another model and have to be made again to be comparable.
+        scope.launch {
+            searchModel.active.collect { model ->
+                if (model != null && model.id != searchModel.indexedWith) queue.send(REEMBED)
+            }
         }
     }
 
@@ -160,7 +170,7 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
         val embedder = embedder() ?: return emptyList()
         val vector = embedder.embed(query)
         _searchModelLoaded.value = true
-        val ranked = withContext(Dispatchers.Default) { loadIndex().search(vector, k, minScore, excluded) }
+        val ranked = withContext(Dispatchers.Default) { loadIndex(vector.size).search(vector, k, minScore, excluded) }
         if (ranked.isEmpty()) return emptyList()
         val rows = dao.chunks(ranked.map { it.first }).associateBy { it.id }
         return ranked.mapNotNull { (id, score) ->
@@ -223,7 +233,55 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
     }
 
     private suspend fun embedder(): Embedder? = embedderLock.withLock {
-        embedder ?: if (searchModel.installed.value) Embedder(searchModel.dir).also { embedder = it } else null
+        val model = searchModel.active.value
+        if (embedderId != model?.id) {
+            embedder?.close()
+            embedder = null
+            embedderId = null
+        }
+        embedder ?: model?.let { Embedder(it.dir).also { e -> embedder = e; embedderId = it.id } }
+    }
+
+    /** Makes [id] the search model; stored passages are re-scored with it in the background. */
+    fun selectSearchModel(id: String) {
+        // Re-scoring for the previous pick is wasted work now; a new pass is queued for this one.
+        current?.takeIf { it.first == REEMBED }?.second?.cancel()
+        searchModel.select(id)
+        _searchModelLoaded.value = false
+    }
+
+    /** Re-scores every ready document's passages with the active model, from their stored text. */
+    private suspend fun reembedAll() {
+        val model = searchModel.active.value ?: return
+        if (model.id == searchModel.indexedWith) return
+        val embedder = embedder() ?: return
+        // Until every passage is done the vectors are a mix, so an interrupted pass is redone.
+        searchModel.indexedWith = ""
+        try {
+            for (doc in dao.withStatus(DocumentStatus.READY)) {
+                _progress.value = _progress.value + (doc.id to 0f)
+                try {
+                    val chunks = dao.chunkTexts(doc.id)
+                    var done = 0
+                    for (batch in chunks.chunked(EMBED_BATCH)) {
+                        val vectors = embedder.embed(batch.map { it.embeddingText })
+                        batch.forEachIndexed { i, chunk -> dao.setEmbedding(chunk.id, Vectors.toBytes(vectors[i])) }
+                        done += batch.size
+                        _progress.value = _progress.value + (doc.id to done.toFloat() / chunks.size)
+                    }
+                } finally {
+                    _progress.value = _progress.value - doc.id
+                }
+            }
+            _searchModelLoaded.value = true
+            searchModel.indexedWith = model.id
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Couldn't re-score documents with ${model.name}", e)
+        } finally {
+            invalidate()
+        }
     }
 
     /** Loads the search model now, so the first search after this is instant. */
@@ -249,28 +307,35 @@ class DocumentLibrary(context: Context, private val scope: CoroutineScope, priva
             embedderLock.withLock {
                 embedder?.close()
                 embedder = null
+                embedderId = null
             }
             _searchModelLoaded.value = false
         }
     }
 
-    /** Removes the downloaded search model. Indexed documents stay and work again once it's back. */
-    fun deleteSearchModel() {
+    /**
+     * Removes a downloaded search model. Indexed documents stay: another installed model takes
+     * over (re-scoring them), or they work again once a model is back.
+     */
+    fun deleteSearchModel(id: String) {
         scope.launch {
-            current?.second?.cancel()
-            embedderLock.withLock {
-                embedder?.close()
-                embedder = null
+            if (searchModel.active.value?.id == id) {
+                current?.second?.cancel()
+                embedderLock.withLock {
+                    embedder?.close()
+                    embedder = null
+                    embedderId = null
+                }
+                _searchModelLoaded.value = false
             }
-            _searchModelLoaded.value = false
-            withContext(Dispatchers.IO) { searchModel.delete() }
+            withContext(Dispatchers.IO) { searchModel.delete(id) }
         }
     }
 
-    private suspend fun loadIndex(): VectorIndex = indexLock.withLock {
-        index ?: run {
-            val rows = dao.readyVectors()
-            val dim = SearchModelStore.DIM
+    /** Passages scored by a model with [dim]-number vectors; any others (mid re-scoring) can't be compared. */
+    private suspend fun loadIndex(dim: Int): VectorIndex = indexLock.withLock {
+        index?.takeIf { it.dim == dim } ?: run {
+            val rows = dao.readyVectors().filter { it.embedding.size == dim * 4 }
             val vectors = FloatArray(rows.size * dim)
             rows.forEachIndexed { i, row -> Vectors.fromBytes(row.embedding).copyInto(vectors, i * dim) }
             VectorIndex(LongArray(rows.size) { rows[it].id }, LongArray(rows.size) { rows[it].documentId }, vectors, dim).also { index = it }

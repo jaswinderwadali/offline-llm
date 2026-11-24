@@ -50,9 +50,14 @@ data class ChunkEntity(
     val text: String,
     val pageStart: Int?,
     val pageEnd: Int?,
-    /** The search model's vector: [SearchModelStore.DIM] little-endian floats. */
+    /** The search model's vector, as little-endian floats (384 for the suggested models). */
     @ColumnInfo(typeAffinity = ColumnInfo.BLOB) val embedding: ByteArray
 )
+
+/** What re-scoring a passage with another search model needs. */
+data class ChunkText(val id: Long, val heading: String?, val text: String) {
+    val embeddingText: String get() = if (heading.isNullOrBlank()) text else "$heading\n$text"
+}
 
 /** Just what a search needs to rank every passage. */
 data class ChunkVector(val id: Long, val documentId: Long, val embedding: ByteArray)
@@ -95,6 +100,12 @@ interface DocumentsDao {
 
     @Query("DELETE FROM chunks WHERE documentId = :documentId")
     suspend fun deleteChunks(documentId: Long)
+
+    @Query("SELECT id, heading, text FROM chunks WHERE documentId = :documentId ORDER BY ordinal")
+    suspend fun chunkTexts(documentId: Long): List<ChunkText>
+
+    @Query("UPDATE chunks SET embedding = :embedding WHERE id = :id")
+    suspend fun setEmbedding(id: Long, embedding: ByteArray)
 
     @Query("SELECT c.id, c.documentId, c.embedding FROM chunks c JOIN documents d ON d.id = c.documentId WHERE d.status = 'ready'")
     suspend fun readyVectors(): List<ChunkVector>

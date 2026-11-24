@@ -144,7 +144,7 @@ internal fun Composer(
     var lastDocuments by remember { mutableStateOf(documents) }
     if (documents != null) lastDocuments = documents
 
-    Surface(color = MaterialTheme.colorScheme.background) {
+    Surface(color = Color.Transparent) {
         Box(
             Modifier
                 .fillMaxWidth()

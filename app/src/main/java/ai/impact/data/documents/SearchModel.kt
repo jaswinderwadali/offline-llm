@@ -1,9 +1,12 @@
 package ai.impact.data.documents
 
+import ai.impact.models.AuxCatalogModel
+import ai.impact.models.AuxFiles
+import ai.impact.models.AuxKind
+import ai.impact.models.AuxModelStore
 import ai.impact.models.DownloadFile
-import ai.impact.models.DownloadSpec
+import ai.impact.models.InstalledAuxModel
 import ai.impact.models.ModelDownload
-import ai.impact.models.ModelDownloader
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -12,94 +15,108 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.io.File
 import java.nio.LongBuffer
 
 /**
- * The small model that turns text into vectors for document search: all-MiniLM-L6-v2
- * (Apache-2.0), 8-bit, about 23 MB. It's downloaded once and runs on the phone with ONNX Runtime.
+ * The models that turn text into vectors for document search. One is active at a time; the
+ * suggested default is all-MiniLM-L6-v2 (Apache-2.0, 8-bit, about 23 MB). Others can come from
+ * the suggestions, Hugging Face, or a folder on the phone. Everything runs with ONNX Runtime.
  */
 class SearchModelStore(context: Context, scope: CoroutineScope) {
 
     companion object {
         const val ID = "all-minilm-l6-v2"
-        const val NAME = "Document search model"
-        const val DIM = 384
-        // Pinned to a commit so the files can't change under an installed app.
-        private const val BASE = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
-        const val MODEL_FILE = "model.onnx"
-        const val VOCAB_FILE = "vocab.txt"
-        private const val MODEL_SIZE = 23_026_053L
-        private const val VOCAB_SIZE = 231_508L
+        const val NAME = "MiniLM L6 (English)"
+        const val MODEL_FILE = AuxFiles.MODEL
+        const val VOCAB_FILE = AuxFiles.VOCAB_TXT
+        private const val KEY_ACTIVE = "active_model"
+        private const val KEY_INDEXED_WITH = "indexed_with"
 
-        val spec = DownloadSpec(
-            id = ID,
-            name = NAME,
-            files = listOf(
-                DownloadFile("$BASE/onnx/model_qint8_arm64.onnx", MODEL_FILE, MODEL_SIZE),
-                DownloadFile("$BASE/$VOCAB_FILE", VOCAB_FILE, VOCAB_SIZE)
-            ),
-            manifest = JSONObject().put("name", NAME).put("repo", "sentence-transformers/all-MiniLM-L6-v2")
-        )
-    }
-
-    private val downloader = ModelDownloader(
-        context = context,
-        scope = scope,
-        prefsName = "search_models",
-        relativeRoot = "search_models",
-        validate = { dir ->
-            val model = File(dir, MODEL_FILE)
-            val vocab = File(dir, VOCAB_FILE)
-            when {
-                model.length() != MODEL_SIZE -> "The search model didn't download completely. Try again."
-                vocab.length() != VOCAB_SIZE -> "The search model's word list didn't download completely. Try again."
-                else -> null
+        private fun suggestion(id: String, name: String, repo: String, sha: String, model: String, modelSize: Long, description: String, license: String, recommended: Boolean = false) =
+            "https://huggingface.co/$repo/resolve/$sha".let { base ->
+                AuxCatalogModel(
+                    id, name, AuxKind.Search, description, license, repo,
+                    listOf(DownloadFile("$base/$model", MODEL_FILE, modelSize), DownloadFile("$base/vocab.txt", VOCAB_FILE, 231_508L)),
+                    recommended
+                )
             }
-        },
-        onInstalled = { refresh() }
-    )
 
-    private val _installed = MutableStateFlow(false)
-    val installed: StateFlow<Boolean> = _installed.asStateFlow()
+        val catalog: List<AuxCatalogModel> = listOf(
+            // Pinned to a commit so the files can't change under an installed app.
+            suggestion(
+                ID, NAME, "sentence-transformers/all-MiniLM-L6-v2", "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+                "onnx/model_qint8_arm64.onnx", 23_026_053L,
+                "Small and quick. A good fit for most phones.", "Apache-2.0", recommended = true
+            ),
+            suggestion(
+                "all-minilm-l12-v2", "MiniLM L12 (English)", "Xenova/all-MiniLM-L12-v2", "beeb2e4b69e95f188a15cc2e90d09fd035dac229",
+                "onnx/model_quantized.onnx", 34_014_366L,
+                "Twice as deep as L6: finds the right passage more often, a little slower.", "Apache-2.0"
+            ),
+            suggestion(
+                "bge-small-en-v1.5", "BGE Small v1.5 (English)", "Xenova/bge-small-en-v1.5", "ea104dacec62c0de699686887e3f920caeb4f3e3",
+                "onnx/model_quantized.onnx", 34_014_426L,
+                "One of the best small search models. Same speed as MiniLM L12.", "MIT"
+            )
+        )
 
-    val download: StateFlow<Map<String, ModelDownload>> = downloader.downloads
-
-    val dir: File get() = downloader.dirFor(ID)
-
-    init {
-        scope.launch(Dispatchers.IO) { refresh() }
+        /** The default download, offered on the Documents screen. */
+        val spec = catalog.first().toDownloadSpec()
     }
 
-    fun refresh() {
-        _installed.value = File(dir, ModelDownloader.COMPLETE).isFile &&
-            File(dir, MODEL_FILE).length() == MODEL_SIZE && File(dir, VOCAB_FILE).length() == VOCAB_SIZE
+    private val prefs = context.applicationContext.getSharedPreferences("search_model", Context.MODE_PRIVATE)
+    val store = AuxModelStore(context, scope, prefsName = "search_models", relativeRoot = "search_models", catalog = catalog)
+
+    val models: StateFlow<List<InstalledAuxModel>> = store.installed
+    val download: StateFlow<Map<String, ModelDownload>> = store.downloads
+
+    private val selectedId = MutableStateFlow(prefs.getString(KEY_ACTIVE, ID) ?: ID)
+
+    /** The model searches use: the chosen one, or any installed one if that's gone. */
+    val active: StateFlow<InstalledAuxModel?> = combine(store.installed, selectedId) { installed, id ->
+        installed.firstOrNull { it.id == id } ?: installed.firstOrNull()
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
+    /** Whether there's a search model to use at all. */
+    val installed: StateFlow<Boolean> = active.map { it != null }.stateIn(scope, SharingStarted.Eagerly, false)
+
+    val dir: File? get() = active.value?.dir
+
+    fun select(id: String) {
+        prefs.edit().putString(KEY_ACTIVE, id).apply()
+        selectedId.value = id
     }
 
-    fun startDownload(): String? = downloader.start(spec)
+    /**
+     * The model the stored passage vectors were made with. Documents indexed before models could
+     * be switched were all made with the default.
+     */
+    var indexedWith: String
+        get() = prefs.getString(KEY_INDEXED_WITH, ID) ?: ID
+        set(value) = prefs.edit().putString(KEY_INDEXED_WITH, value).apply()
+
+    fun startDownload(): String? = store.startDownload(spec)
 
     /** Deletes the downloaded files. Call through [DocumentLibrary.deleteSearchModel], which closes it first. */
-    fun delete() {
-        downloader.cancel(ID)
-        dir.deleteRecursively()
-        refresh()
-    }
+    fun delete(id: String) = store.delete(id)
 
-    val sizeBytes: Long get() = spec.sizeBytes
+    val sizeBytes: Long get() = active.value?.sizeBytes ?: spec.sizeBytes
 
-    fun cancelDownload() = downloader.cancel(ID)
+    fun cancelDownload() = store.cancelDownload(ID)
 
-    fun dismissError() = downloader.dismiss(ID)
+    fun dismissError() = store.dismissError(ID)
 }
 
 /**
- * Turns text into 384-number vectors that are close together when the meaning is. Loaded on
+ * Turns text into vectors (384 numbers for the suggested models) that are close together when the meaning is. Loaded on
  * first use and kept, since it's small (about 50 MB of RAM) and every chat message needs it.
  */
 class Embedder(private val modelDir: File) {
@@ -150,10 +167,18 @@ class Embedder(private val modelDir: File) {
         OnnxTensor.createTensor(env, LongBuffer.wrap(ids), shape).use { idTensor ->
             OnnxTensor.createTensor(env, LongBuffer.wrap(mask), shape).use { maskTensor ->
                 OnnxTensor.createTensor(env, LongBuffer.wrap(types), shape).use { typeTensor ->
+                    // Some exports (e.g. DistilBERT) have no token_type_ids input.
                     val inputs = mapOf("input_ids" to idTensor, "attention_mask" to maskTensor, "token_type_ids" to typeTensor)
+                        .filterKeys { it in session.inputNames }
                     session.run(inputs).use { result ->
-                        val hidden = (result.get(0) as OnnxTensor).floatBuffer
+                        val output = result.get(0) as OnnxTensor
+                        val hidden = output.floatBuffer
                         val flat = FloatArray(hidden.remaining()).also { hidden.get(it) }
+                        // A model that already pools gives one vector per text.
+                        if (output.info.shape.size == 2) {
+                            val dim = flat.size / batch.size
+                            return batch.indices.map { b -> Vectors.normalize(flat.copyOfRange(b * dim, (b + 1) * dim)) }
+                        }
                         val dim = flat.size / (batch.size * length)
                         return batch.indices.map { b ->
                             val rowMask = IntArray(length) { t -> mask[b * length + t].toInt() }

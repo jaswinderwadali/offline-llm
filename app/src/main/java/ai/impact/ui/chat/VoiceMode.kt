@@ -1,18 +1,5 @@
 package ai.impact.ui.chat
 
-import androidx.compose.foundation.border
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.alpha
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.SizeTransform
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.graphics.graphicsLayer
-import kotlinx.coroutines.delay
-import androidx.compose.ui.platform.LocalView
-import androidx.compose.runtime.produceState
-import androidx.compose.runtime.DisposableEffect
-import ai.impact.ChatViewModel
 import ai.impact.VoicePhase
 import ai.impact.VoiceState
 import ai.impact.data.Persona
@@ -20,14 +7,15 @@ import ai.impact.ui.components.PersonaAvatar
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -38,6 +26,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -46,10 +35,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
@@ -58,34 +49,44 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.sin
 
-private val Night = Color(0xFF07080D)
+private val Ink = Color(0xFF040507)
+
+// Galaxy-style light: cool blue, violet and cyan, with the personality's own colour mixed in.
+private val GlowBlue = Color(0xFF3D7BFF)
+private val GlowViolet = Color(0xFF8E5BFF)
+private val GlowCyan = Color(0xFF2ED3E6)
 
 /**
- * Hands-free voice conversation, on top of the chat: an aurora in the personality's colours, a
- * glowing orb that follows the conversation, live captions, and one big button that does the
- * obvious thing at each moment.
+ * Hands-free voice conversation: a calm, nearly black screen with large captions, a soft band of
+ * flowing light along the bottom that moves with the conversation, and two round controls.
  */
 @Composable
 fun VoiceModeOverlay(
@@ -103,382 +104,277 @@ fun VoiceModeOverlay(
     val view = LocalView.current
     DisposableEffect(view) {
         view.keepScreenOn = true
-        onDispose { view.keepScreenOn = false }
+        // The screen is dark whatever the app's theme, so the status bar icons turn light.
+        val window = (view.context as? android.app.Activity)?.window
+        val bars = window?.let { androidx.core.view.WindowCompat.getInsetsController(it, view) }
+        val lightIcons = bars?.isAppearanceLightStatusBars
+        val lightNav = bars?.isAppearanceLightNavigationBars
+        bars?.isAppearanceLightStatusBars = false
+        bars?.isAppearanceLightNavigationBars = false
+        onDispose {
+            view.keepScreenOn = false
+            lightIcons?.let { bars.isAppearanceLightStatusBars = it }
+            lightNav?.let { bars.isAppearanceLightNavigationBars = it }
+        }
     }
-    val start = Color(persona.colorStart)
-    val end = Color(persona.colorEnd)
-    val time by rememberInfiniteTransition(label = "time").animateFloat(
-        initialValue = 0f, targetValue = (2 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(tween(9_000, easing = LinearEasing)),
-        label = "clock"
-    )
+    val accent = Color(persona.colorStart)
+    // One continuous clock for the light. It's read only while drawing, so the screen redraws
+    // each frame without recomposing, and nothing jumps when a loop would restart.
+    val clock = rememberClock()
+    val latest = rememberUpdatedState(state)
+
     // Swallows taps so the chat underneath can't be touched.
     Box(
         Modifier
             .fillMaxSize()
-            .background(Night)
+            .background(Ink)
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { }
     ) {
-        Aurora(start, end, time, dim = state.phase == VoicePhase.Paused)
-        Column(
-            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding(),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(Modifier.staggered(reveal, from = 0.45f, slide = (-24).dp)) { Header(persona, onEnd) }
-            Spacer(Modifier.weight(0.7f))
-            Box(
-                Modifier
-                    .staggered(reveal, from = 0.15f, scaleFrom = 0.35f)
-                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onTap),
-                contentAlignment = Alignment.Center
-            ) {
-                Orb(state, start, end, time)
-                Text(persona.emoji, fontSize = 52.sp)
-            }
-            Spacer(Modifier.height(20.dp))
-            Box(Modifier.staggered(reveal, from = 0.35f, slide = 12.dp)) { PhaseChip(state.phase, state.since, start) }
-            Spacer(Modifier.height(18.dp))
-            Box(Modifier.staggered(reveal, from = 0.4f, scaleFrom = 0.6f)) { Waveform(state, start, end, time) }
-            Spacer(Modifier.weight(0.5f))
-            Box(Modifier.staggered(reveal, from = 0.5f, slide = 16.dp)) { Captions(state) }
-            Spacer(Modifier.weight(0.5f))
-            Box(Modifier.staggered(reveal, from = 0.55f, slide = 40.dp)) { Controls(state, start, end, onTap) }
-            Spacer(Modifier.height(20.dp))
+        GlowBand(latest, accent, clock, Modifier.align(Alignment.BottomCenter).staggered(reveal, from = 0.1f, slide = 80.dp))
+        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+            Box(Modifier.staggered(reveal, from = 0.45f, slide = (-16).dp)) { TopBar(persona) }
+            Box(Modifier.weight(1f).staggered(reveal, from = 0.4f, slide = 20.dp)) { Transcript(state) }
+            Box(Modifier.staggered(reveal, from = 0.5f, slide = 32.dp)) { Controls(state.phase, onTap, onEnd) }
+            Spacer(Modifier.height(28.dp))
         }
     }
 }
 
-/** Two soft blobs of the personality's colours drifting slowly behind everything. */
+// region Motion
+
+/** Seconds since voice mode opened, from the frame clock: smooth, and it never wraps around. */
 @Composable
-private fun Aurora(start: Color, end: Color, time: Float, dim: Boolean) {
-    val strength by animateFloatAsState(if (dim) 0.18f else 0.42f, tween(800), label = "aurora")
-    Canvas(Modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        fun blob(color: Color, cx: Float, cy: Float, r: Float) = drawCircle(
-            Brush.radialGradient(listOf(color.copy(alpha = strength), Color.Transparent), center = Offset(cx, cy), radius = r),
-            radius = r, center = Offset(cx, cy)
-        )
-        blob(start, w * (0.25f + 0.12f * sin(time)), h * (0.28f + 0.06f * cos(time)), w * 0.95f)
-        blob(end, w * (0.78f + 0.10f * cos(time * 2)), h * (0.62f + 0.07f * sin(time)), w * 0.9f)
-        // A darker floor keeps the captions and controls readable.
-        drawRect(Brush.verticalGradient(listOf(Color.Transparent, Night.copy(alpha = 0.85f)), startY = h * 0.55f, endY = h))
+private fun rememberClock(): State<Float> {
+    val clock = remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(Unit) {
+        val origin = withFrameNanos { it }
+        while (true) withFrameNanos { clock.floatValue = (it - origin) / 1_000_000_000f }
     }
+    return clock
 }
 
-@Composable
-private fun Header(persona: Persona, onEnd: () -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        PersonaAvatar(persona, size = 40.dp)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(persona.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = Color.White)
-            Text("Hands-free · on this phone", style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.6f))
-        }
-        Surface(onClick = onEnd, shape = CircleShape, color = Color.White.copy(alpha = 0.12f), modifier = Modifier.size(44.dp)) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(Icons.Default.Close, contentDescription = "Close voice mode", tint = Color.White)
-            }
-        }
-    }
+/** Moves [current] toward [target], covering most of the way in about [seconds]: no jumps, ever. */
+private fun ease(current: Float, target: Float, dt: Float, seconds: Float): Float =
+    current + (target - current) * (1f - exp(-dt / seconds))
+
+/** The light's state, eased every frame toward what the current phase wants. */
+private class GlowMotion {
+    var last = -1f
+    /** How tall and bright the light is, 0 to 1. */
+    var energy = 0.3f
+    /** How fast the colours flow along the band. */
+    var speed = 0.25f
+    var flow = 0f
+    var dim = 0f
 }
+
+// endregion
 
 /**
- * A glowing sphere: it breathes while idle, swells with the user's voice, pulses while speaking
- * and spins its rim while thinking.
+ * The band of light along the bottom. Listening, it rises and falls with the user's voice;
+ * thinking, its colours flow steadily; speaking, it swells softly; paused, it settles low.
  */
 @Composable
-private fun Orb(state: VoiceState, start: Color, end: Color, time: Float) {
-    val level by animateFloatAsState(if (state.phase == VoicePhase.Listening) state.level else 0f, tween(80), label = "level")
-    val energy = when (state.phase) {
-        VoicePhase.Listening -> 0.15f + level * 0.85f
-        VoicePhase.Speaking -> 0.35f + 0.25f * abs(sin(time * 9)) * abs(cos(time * 5))
-        VoicePhase.Thinking -> 0.3f + 0.1f * sin(time * 6)
-        VoicePhase.Paused -> 0.05f
-    }
-    val spin = if (state.phase == VoicePhase.Thinking) time * 6 else time
-    val alpha by animateFloatAsState(if (state.phase == VoicePhase.Paused) 0.55f else 1f, tween(500), label = "orbAlpha")
-    Canvas(Modifier.size(280.dp)) {
-        val c = center
-        val base = size.minDimension * 0.26f
-        // Outer glow, wider with more energy.
-        drawCircle(
-            Brush.radialGradient(listOf(start.copy(alpha = 0.55f * alpha), end.copy(alpha = 0.18f * alpha), Color.Transparent), c, base * (1.9f + energy * 0.5f)),
-            radius = base * (1.9f + energy * 0.5f), center = c
+private fun GlowBand(state: State<VoiceState>, accent: Color, clock: State<Float>, modifier: Modifier) {
+    val motion = remember { GlowMotion() }
+    Canvas(modifier.fillMaxWidth().fillMaxHeight(0.62f)) {
+        val t = clock.value
+        val dt = if (motion.last < 0f) 0f else (t - motion.last).coerceIn(0f, 0.1f)
+        motion.last = t
+        val phase = state.value.phase
+        val target = when (phase) {
+            VoicePhase.Listening -> 0.32f + state.value.level * 0.68f
+            VoicePhase.Thinking -> 0.42f + 0.08f * sin(t * 1.9f)
+            // Two slow waves together read as speech without flickering.
+            VoicePhase.Speaking -> 0.55f + 0.16f * sin(t * 5.2f) * sin(t * 2.9f + 1f)
+            VoicePhase.Paused -> 0.14f
+        }
+        motion.energy = ease(motion.energy, target, dt, if (phase == VoicePhase.Listening) 0.09f else 0.35f)
+        motion.speed = ease(motion.speed, if (phase == VoicePhase.Thinking) 0.9f else 0.22f, dt, 0.8f)
+        motion.flow += motion.speed * dt
+        motion.dim = ease(motion.dim, if (phase == VoicePhase.Paused) 1f else 0f, dt, 0.4f)
+
+        val w = size.width
+        val h = size.height
+        val e = motion.energy
+        val f = motion.flow
+        val brightness = 1f - 0.45f * motion.dim
+        // Each light drifts along the bottom edge at its own pace; together they flow.
+        val lights = listOf(
+            GlowBlue to 0.0f,
+            lerp(GlowViolet, accent, 0.35f) to 2.1f,
+            GlowCyan to 4.2f,
+            lerp(GlowBlue, accent, 0.55f) to 5.3f
         )
-        // Rings that ripple outward with the voice.
-        for (i in 0 until 3) {
-            val t = ((time / (2 * PI).toFloat()) * 3 + i / 3f) % 1f
+        lights.forEachIndexed { i, (color, offset) ->
+            val x = w * (0.5f + 0.42f * sin(f * (0.8f + i * 0.17f) + offset))
+            val y = h * (1.02f - 0.08f * cos(f * 0.7f + offset))
+            val radius = w * (0.42f + 0.38f * e) * (0.9f + 0.1f * sin(t * 0.6f + i))
             drawCircle(
-                color = lerp(start, end, t).copy(alpha = (1 - t) * 0.35f * energy * alpha),
-                radius = base * (1.05f + t * (0.5f + energy * 0.6f)),
-                center = c,
-                style = Stroke(width = 2.dp.toPx())
+                Brush.radialGradient(
+                    listOf(color.copy(alpha = 0.62f * brightness), color.copy(alpha = 0.22f * brightness), Color.Transparent),
+                    center = Offset(x, y), radius = radius
+                ),
+                radius = radius, center = Offset(x, y)
             )
         }
-        // A rotating rim of light.
-        rotate(Math.toDegrees(spin.toDouble()).toFloat(), c) {
-            drawCircle(
-                Brush.sweepGradient(listOf(start, end, Color.White.copy(alpha = 0.9f), start), c),
-                radius = base * (1.08f + energy * 0.08f), center = c, alpha = alpha,
-                style = Stroke(width = 3.dp.toPx())
+        // A thin bright horizon where the light meets the edge of the screen.
+        drawRect(
+            Brush.verticalGradient(
+                listOf(Color.Transparent, Color.White.copy(alpha = 0.10f * e * brightness)),
+                startY = h * 0.85f, endY = h
             )
-        }
-        // The sphere: lit from the top left.
-        val r = base * (1f + energy * 0.08f)
-        drawCircle(
-            Brush.radialGradient(
-                listOf(lerp(end, Color.White, 0.35f), start, lerp(start, Night, 0.55f)),
-                center = Offset(c.x - r * 0.35f, c.y - r * 0.4f), radius = r * 1.6f
-            ),
-            radius = r, center = c, alpha = alpha
         )
-        drawCircle(
-            Brush.radialGradient(listOf(Color.White.copy(alpha = 0.35f), Color.Transparent), Offset(c.x - r * 0.35f, c.y - r * 0.45f), r * 0.5f),
-            radius = r * 0.5f, center = Offset(c.x - r * 0.35f, c.y - r * 0.45f)
-        )
+        // Fades the light into the black above, so the captions sit on a clean background.
+        drawRect(Brush.verticalGradient(listOf(Ink, Ink.copy(alpha = 0f)), startY = 0f, endY = h * 0.45f))
     }
 }
 
 @Composable
-private fun PhaseChip(phase: VoicePhase, since: Long, accent: Color) {
-    // Listening and thinking have time limits, so they show how long they've been going.
-    val limit = when (phase) {
-        VoicePhase.Listening -> ChatViewModel.VOICE_LISTEN_LIMIT_MS
-        VoicePhase.Thinking -> ChatViewModel.VOICE_THINK_LIMIT_MS
-        else -> null
-    }
-    val elapsed by produceState(0L, phase, since) {
-        while (true) {
-            value = System.currentTimeMillis() - since
-            delay(500)
+private fun TopBar(persona: Persona) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Surface(shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.08f)) {
+            Row(Modifier.padding(start = 4.dp, end = 14.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                PersonaAvatar(persona, size = 28.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(persona.name, style = MaterialTheme.typography.labelLarge, color = Color.White)
+                Text("  ·  On this phone", style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.5f))
+            }
         }
     }
-    val label = when (phase) {
-        VoicePhase.Listening -> "Listening"
-        VoicePhase.Thinking -> "Thinking"
-        VoicePhase.Speaking -> "Speaking"
-        VoicePhase.Paused -> "Paused"
+}
+
+/** What the user said, and what's being said back, in large, plain type. */
+@Composable
+private fun Transcript(state: VoiceState) {
+    val heard = state.heard.takeIf { it.isNotBlank() && it != "…" && state.phase != VoicePhase.Paused }
+    val main = when (state.phase) {
+        VoicePhase.Listening -> if (heard == null) "Go ahead, I'm listening." else ""
+        VoicePhase.Thinking -> ""
+        VoicePhase.Speaking -> state.reply
+        VoicePhase.Paused -> state.notice ?: "Tap the mic when you're ready."
     }
-    val blink by rememberInfiniteTransition(label = "blink").animateFloat(
-        initialValue = 0.35f, targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "dot"
-    )
-    Surface(shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.1f)) {
-        Row(Modifier.padding(horizontal = 14.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(8.dp).clip(CircleShape)
-                    .background(if (phase == VoicePhase.Paused) Color.White.copy(alpha = 0.5f) else accent.copy(alpha = blink))
-            )
-            Spacer(Modifier.width(8.dp))
-            AnimatedContent(phase, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "phase") { _ ->
-                Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White, fontWeight = FontWeight.Medium)
-            }
-            if (limit != null) {
-                // Turns amber in the last 30 seconds before the limit.
-                val nearLimit = limit - elapsed < 30_000
-                Spacer(Modifier.width(8.dp))
+    val scroll = rememberScrollState()
+    // A long reply keeps its newest words in view.
+    LaunchedEffect(main) { scroll.animateScrollTo(scroll.maxValue) }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(scroll)
+            .padding(horizontal = 28.dp, vertical = 24.dp)
+    ) {
+        StatusLabel(state.phase)
+        Spacer(Modifier.height(18.dp))
+        AnimatedContent(heard, transitionSpec = { fadeIn(tween(250)) togetherWith fadeOut(tween(150)) }, label = "heard") { text ->
+            if (text != null) {
                 Text(
-                    "${clock(elapsed)} / ${clock(limit)}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (nearLimit) Color(0xFFFFB547) else Color.White.copy(alpha = 0.6f)
+                    text,
+                    style = MaterialTheme.typography.titleMedium.copy(lineHeight = 26.sp),
+                    color = Color.White.copy(alpha = if (state.phase == VoicePhase.Listening) 0.9f else 0.5f),
+                    maxLines = if (state.phase == VoicePhase.Listening) 8 else 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (heard != null && main.isNotEmpty()) Spacer(Modifier.height(22.dp))
+        AnimatedContent(
+            main,
+            transitionSpec = { (fadeIn(tween(350)) + slideInVertically(tween(350)) { it / 8 }) togetherWith fadeOut(tween(180)) },
+            label = "main"
+        ) { text ->
+            if (text.isNotEmpty()) {
+                Text(
+                    text,
+                    style = MaterialTheme.typography.headlineSmall.copy(fontSize = 26.sp, lineHeight = 35.sp),
+                    color = Color.White,
+                    fontWeight = FontWeight.Normal
                 )
             }
         }
     }
 }
 
-/** Bars that move with the user's voice, or ripple while the reply is spoken. */
+/** "Listening", "Thinking"… with light passing through the word while it's busy. */
 @Composable
-private fun Waveform(state: VoiceState, start: Color, end: Color, time: Float) {
-    val level by animateFloatAsState(if (state.phase == VoicePhase.Listening) state.level else 0f, tween(80), label = "bars")
-    val bars = 28
-    Canvas(Modifier.width(220.dp).height(36.dp)) {
-        val gap = size.width / bars
-        val barWidth = gap * 0.45f
-        for (i in 0 until bars) {
-            // Taller in the middle, like a voice print.
-            val shape = sin(PI.toFloat() * (i + 0.5f) / bars)
-            val wobble = 0.5f + 0.5f * sin(time * 7 + i * 0.9f) * cos(time * 3 + i * 0.4f)
-            val amount = when (state.phase) {
-                VoicePhase.Listening -> 0.08f + level * shape * (0.5f + 0.5f * wobble)
-                VoicePhase.Speaking -> 0.12f + 0.55f * shape * wobble
-                VoicePhase.Thinking -> 0.08f + 0.1f * abs(sin(time * 4 + i * 0.5f))
-                VoicePhase.Paused -> 0.06f
-            }.coerceIn(0.04f, 1f)
-            val h = size.height * amount
-            val x = i * gap + (gap - barWidth) / 2
-            drawRoundRect(
-                color = lerp(start, end, i / (bars - 1f)).copy(alpha = if (state.phase == VoicePhase.Paused) 0.35f else 0.9f),
-                topLeft = Offset(x, (size.height - h) / 2),
-                size = androidx.compose.ui.geometry.Size(barWidth, h),
-                cornerRadius = androidx.compose.ui.geometry.CornerRadius(barWidth / 2)
-            )
-        }
+private fun StatusLabel(phase: VoicePhase) {
+    val label = when (phase) {
+        VoicePhase.Listening -> "Listening"
+        VoicePhase.Thinking -> "Thinking"
+        VoicePhase.Speaking -> "Speaking"
+        VoicePhase.Paused -> "Paused"
+    }
+    val shimmer by rememberInfiniteTransition(label = "status").animateFloat(
+        initialValue = -1f, targetValue = 2f,
+        animationSpec = infiniteRepeatable(tween(1_800, easing = LinearEasing)), label = "shimmer"
+    )
+    AnimatedContent(label, transitionSpec = { fadeIn(tween(250)) togetherWith fadeOut(tween(150)) }, label = "statusLabel") { text ->
+        val busy = phase == VoicePhase.Thinking || phase == VoicePhase.Listening
+        Text(
+            text,
+            style = MaterialTheme.typography.titleSmall.copy(
+                letterSpacing = 0.4.sp,
+                brush = if (busy) Brush.linearGradient(
+                    listOf(Color.White.copy(alpha = 0.45f), Color.White, Color.White.copy(alpha = 0.45f)),
+                    start = Offset(shimmer * 300f - 150f, 0f), end = Offset(shimmer * 300f + 150f, 0f)
+                ) else null
+            ),
+            color = Color.White.copy(alpha = 0.6f)
+        )
     }
 }
 
-/** What the user said, and what's being said back. */
+/** The main button does the obvious thing right now; the other ends voice mode. */
 @Composable
-private fun Captions(state: VoiceState) {
-    Column(
-        Modifier.fillMaxWidth().padding(horizontal = 28.dp).height(190.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        val heard = state.heard.takeIf { it.isNotBlank() && it != "…" }
-        if (heard != null && state.phase != VoicePhase.Paused) {
-            Surface(shape = RoundedCornerShape(18.dp), color = Color.White.copy(alpha = 0.08f)) {
-                Column(Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
-                    Text("You", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.5f))
-                    Text(heard, style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.85f), maxLines = 2, overflow = TextOverflow.Ellipsis)
-                }
-            }
-        }
-        val main = when (state.phase) {
-            VoicePhase.Listening -> if (heard == null) "Go ahead, I'm listening." else ""
-            VoicePhase.Thinking -> ""
-            VoicePhase.Speaking -> state.reply
-            VoicePhase.Paused -> state.notice ?: "Tap the mic when you're ready."
-        }
-        AnimatedContent(main, transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(200)) }, label = "caption") { text ->
-            Text(
-                text,
-                style = MaterialTheme.typography.titleLarge,
-                color = Color.White,
-                fontWeight = FontWeight.Medium,
-                textAlign = TextAlign.Center,
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-                lineHeight = 30.sp
-            )
-        }
-    }
-}
-
-/**
- * One big button that does what makes sense right now. While thinking it becomes a glowing pill
- * with a shimmer and bouncing dots, and turns back into the button when it's time to talk.
- * (The close button at the top ends voice mode.)
- */
-@Composable
-private fun Controls(state: VoiceState, start: Color, end: Color, onTap: () -> Unit) {
-    val thinking = state.phase == VoicePhase.Thinking
-    Box(Modifier.fillMaxWidth().height(116.dp), contentAlignment = Alignment.Center) {
-        AnimatedContent(
-            targetState = thinking,
-            transitionSpec = {
-                (fadeIn(tween(260)) + scaleIn(tween(320), initialScale = 0.7f)) togetherWith
-                    (fadeOut(tween(180)) + scaleOut(tween(220), targetScale = 0.7f)) using
-                    SizeTransform(clip = false)
-            },
-            label = "controls"
-        ) { isThinking ->
-            if (isThinking) ThinkingPill(start, end) else MainButton(state.phase, start, end, onTap)
-        }
-    }
-}
-
-@Composable
-private fun MainButton(phase: VoicePhase, start: Color, end: Color, onTap: () -> Unit) {
+private fun Controls(phase: VoicePhase, onTap: () -> Unit, onEnd: () -> Unit) {
     val (icon, label) = when (phase) {
-        VoicePhase.Listening -> Icons.Default.Check to "Done talking"
+        VoicePhase.Listening -> Icons.Default.ArrowUpward to "Send now"
         VoicePhase.Speaking -> Icons.Default.Stop to "Interrupt"
-        else -> Icons.Default.Mic to "Tap to talk"
+        VoicePhase.Thinking -> Icons.Default.Mic to "Thinking…"
+        VoicePhase.Paused -> Icons.Default.Mic to "Tap to talk"
     }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.Top) {
+        RoundControl(
+            icon = icon, label = label,
+            background = Color.White, tint = Ink,
+            enabled = phase != VoicePhase.Thinking,
+            onClick = onTap
+        )
+        Spacer(Modifier.width(36.dp))
+        RoundControl(
+            icon = Icons.Default.Close, label = "End",
+            background = Color(0xFFE5484D), tint = Color.White,
+            onClick = onEnd
+        )
+    }
+}
+
+@Composable
+private fun RoundControl(icon: ImageVector, label: String, background: Color, tint: Color, onClick: () -> Unit, enabled: Boolean = true) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Surface(onClick = onTap, shape = CircleShape, color = Color.Transparent, modifier = Modifier.size(88.dp)) {
-            Box(
-                Modifier.fillMaxSize().background(Brush.linearGradient(listOf(start, end)), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
+        Surface(
+            onClick = onClick,
+            enabled = enabled,
+            shape = CircleShape,
+            color = if (enabled) background else Color.White.copy(alpha = 0.12f),
+            modifier = Modifier.size(68.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
                 AnimatedContent(
                     icon,
-                    transitionSpec = { (scaleIn(initialScale = 0.4f) + fadeIn()) togetherWith (scaleOut(targetScale = 0.4f) + fadeOut()) },
-                    label = "icon"
-                ) { Icon(it, contentDescription = label, tint = Color.White, modifier = Modifier.size(36.dp)) }
+                    transitionSpec = { (scaleIn(tween(220), initialScale = 0.6f) + fadeIn(tween(220))) togetherWith (scaleOut(tween(150), targetScale = 0.6f) + fadeOut(tween(150))) },
+                    label = "controlIcon"
+                ) {
+                    Icon(it, contentDescription = label, tint = if (enabled) tint else Color.White.copy(alpha = 0.5f), modifier = Modifier.size(28.dp))
+                }
             }
         }
-        Spacer(Modifier.height(8.dp))
-        AnimatedContent(label, transitionSpec = { fadeIn() togetherWith fadeOut() }, label = "label") {
-            Text(it, style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.85f))
-        }
+        Spacer(Modifier.height(10.dp))
+        Text(label, style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.7f), maxLines = 1)
     }
-}
-
-/**
- * Shown while the reply is being made: a soft pill with light sweeping across it in the
- * personality's colours, three dots bouncing in turn, and a breathing glow behind.
- */
-@Composable
-private fun ThinkingPill(start: Color, end: Color) {
-    val transition = rememberInfiniteTransition(label = "thinking")
-    val sweep by transition.animateFloat(
-        initialValue = -0.6f, targetValue = 1.6f,
-        animationSpec = infiniteRepeatable(tween(1_600, easing = LinearEasing)), label = "sweep"
-    )
-    val bounce by transition.animateFloat(
-        initialValue = 0f, targetValue = 3f,
-        animationSpec = infiniteRepeatable(tween(1_200, easing = LinearEasing)), label = "bounce"
-    )
-    val glow by transition.animateFloat(
-        initialValue = 0.35f, targetValue = 0.75f,
-        animationSpec = infiniteRepeatable(tween(1_100), RepeatMode.Reverse), label = "glow"
-    )
-    Box(contentAlignment = Alignment.Center) {
-        // A breathing halo in the personality's colours.
-        Box(
-            Modifier
-                .size(width = 260.dp, height = 84.dp)
-                .alpha(glow)
-                .background(Brush.radialGradient(listOf(start.copy(alpha = 0.55f), end.copy(alpha = 0.2f), Color.Transparent)), RoundedCornerShape(50))
-        )
-        Box(
-            Modifier
-                .size(width = 220.dp, height = 60.dp)
-                .clip(RoundedCornerShape(50))
-                .background(Color.White.copy(alpha = 0.08f))
-                .drawBehind {
-                    // A band of light moving left to right.
-                    val x = size.width * sweep
-                    drawRect(
-                        Brush.horizontalGradient(
-                            listOf(Color.Transparent, start.copy(alpha = 0.55f), end.copy(alpha = 0.7f), Color.Transparent),
-                            startX = x - size.width * 0.45f, endX = x + size.width * 0.45f
-                        )
-                    )
-                }
-                .border(1.dp, Brush.linearGradient(listOf(start.copy(alpha = 0.7f), end.copy(alpha = 0.7f))), RoundedCornerShape(50)),
-            contentAlignment = Alignment.Center
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                for (i in 0 until 3) {
-                    // Each dot rises and falls in turn.
-                    val phase = ((bounce - i * 0.33f) % 1f + 1f) % 1f
-                    val lift = if (phase < 0.5f) sin(phase * 2 * PI.toFloat()) else 0f
-                    Box(
-                        Modifier
-                            .padding(horizontal = 4.dp)
-                            .graphicsLayer { translationY = -lift * 8.dp.toPx() }
-                            .size(9.dp)
-                            .clip(CircleShape)
-                            .background(lerp(start, end, i / 2f).copy(alpha = 0.6f + 0.4f * lift))
-                    )
-                }
-                Spacer(Modifier.width(12.dp))
-                Text("Thinking", style = MaterialTheme.typography.titleSmall, color = Color.White, fontWeight = FontWeight.Medium)
-            }
-        }
-    }
-}
-
-/** 75_000 ms → "1:15". */
-private fun clock(millis: Long): String {
-    val seconds = (millis / 1000).coerceAtLeast(0)
-    return "%d:%02d".format(seconds / 60, seconds % 60)
 }
 
 /**
@@ -495,4 +391,3 @@ private fun Modifier.staggered(reveal: Float, from: Float, slide: Dp = 0.dp, sca
     scaleX = scale
     scaleY = scale
 }
-

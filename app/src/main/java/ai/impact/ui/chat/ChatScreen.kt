@@ -1,5 +1,17 @@
 package ai.impact.ui.chat
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.animation.core.Spring
@@ -37,6 +49,7 @@ import androidx.compose.material3.SnackbarResult
 import ai.impact.ui.components.Chip
 import ai.impact.ui.components.PersonaAvatar
 import ai.impact.ui.components.brush
+import ai.impact.ui.theme.calmBackground
 import android.widget.Toast
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -328,20 +341,38 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+    // Stay pinned to the bottom while a reply types itself out, unless the user scrolls up to read.
+    var followBottom by remember { mutableStateOf(true) }
+    val listDragged by listState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(listDragged) { if (listDragged) followBottom = false }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to listState.canScrollForward }
+            .collect { (_, canScrollDown) -> if (!canScrollDown) followBottom = true }
     }
-    LaunchedEffect(messages.lastOrNull()?.text?.length, messages.lastOrNull()?.imageId) {
-        val last = messages.lastOrNull() ?: return@LaunchedEffect
-        if (last.isStreaming || last.imageId != null) listState.scrollToItem(messages.lastIndex)
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            if (last == null || last.index != info.totalItemsCount - 1) 0
+            else last.offset + last.size - (info.viewportEndOffset - info.afterContentPadding)
+        }.collect { overflow ->
+            if (followBottom && overflow > 0 && !listDragged) listState.scrollBy(overflow.toFloat())
+        }
+    }
+    LaunchedEffect(messages.size) {
+        followBottom = true
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }
 
     // The top bar slides away while scrolling up through the chat and returns on scrolling down.
     val topBarScroll = TopAppBarDefaults.enterAlwaysScrollBehavior()
     var micCenter by remember { mutableStateOf<Offset?>(null) }
     Scaffold(
-        modifier = Modifier.fillMaxSize().nestedScroll(topBarScroll.nestedScrollConnection),
-        containerColor = MaterialTheme.colorScheme.background,
+        modifier = Modifier
+            .fillMaxSize()
+            .calmBackground(accent = Color(persona.colorStart))
+            .nestedScroll(topBarScroll.nestedScrollConnection),
+        containerColor = Color.Transparent,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = {
             SnackbarHost(snackbarHostState, modifier = Modifier.padding(bottom = 76.dp).navigationBarsPadding()) { data ->
@@ -386,8 +417,8 @@ fun ChatScreen(
                 },
                 scrollBehavior = topBarScroll,
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    scrolledContainerColor = MaterialTheme.colorScheme.background
+                    containerColor = Color.Transparent,
+                    scrolledContainerColor = Color.Transparent
                 )
             )
         }
@@ -415,8 +446,8 @@ fun ChatScreen(
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(22.dp)
                     ) {
                         itemsIndexed(
                             messages,
@@ -687,6 +718,28 @@ private fun ModelBanner(modelState: ModelState, onPickModel: () -> Unit) {
     }
 }
 
+/**
+ * Gives a message that just arrived a soft spring entrance: it rises a little and grows from
+ * its own corner. Messages restored from history (or scrolled back into view) appear as is.
+ */
+@Composable
+private fun Modifier.messageEntrance(createdAt: Long, fromEnd: Boolean): Modifier {
+    val fresh = remember { System.currentTimeMillis() - createdAt < 1_500 }
+    val progress = remember { Animatable(if (fresh) 0f else 1f) }
+    LaunchedEffect(Unit) {
+        if (fresh) progress.animateTo(1f, spring(dampingRatio = 0.78f, stiffness = Spring.StiffnessMediumLow))
+    }
+    return graphicsLayer {
+        val p = progress.value
+        alpha = p.coerceIn(0f, 1f)
+        translationY = (1f - p) * 18.dp.toPx()
+        val scale = 0.94f + 0.06f * p
+        scaleX = scale
+        scaleY = scale
+        transformOrigin = TransformOrigin(if (fromEnd) 1f else 0f, 1f)
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
@@ -707,26 +760,43 @@ private fun MessageBubble(
 
     if (message.isUser) {
         var menuOpen by remember { mutableStateOf(false) }
-        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(start = 48.dp),
+            horizontalAlignment = Alignment.End
+        ) {
             message.skill?.let { skill ->
                 SkillLabel(
                     skill,
                     auto = message.isAutoSkill,
                     onReplyAsChat = onReplyAsChat?.takeIf { message.isAutoSkill }?.let { send -> { send(message.text) } },
-                    modifier = Modifier.padding(end = 8.dp, bottom = 4.dp)
+                    modifier = Modifier.padding(end = 4.dp, bottom = 6.dp)
                 )
             }
-            Box {
+            Box(Modifier.messageEntrance(message.createdAt, fromEnd = true)) {
+                val shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp, bottomEnd = 8.dp, bottomStart = 22.dp)
                 Box(
                     Modifier
-                        .widthIn(max = 300.dp)
-                        .clip(RoundedCornerShape(22.dp, 22.dp, 6.dp, 22.dp))
-                        // Your messages echo the icon's bubble: charcoal in light mode, cream in dark mode.
-                        .background(MaterialTheme.colorScheme.inverseSurface)
+                        .widthIn(max = 320.dp)
+                        .clip(shape)
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    MaterialTheme.colorScheme.surfaceContainerHigh
+                                )
+                            )
+                        )
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f), shape)
                         .combinedClickable(onClick = {}, onLongClick = { menuOpen = true })
                         .padding(horizontal = 16.dp, vertical = 11.dp)
                 ) {
-                    Text(message.text, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.inverseOnSurface)
+                    Text(
+                        message.text,
+                        style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp),
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
@@ -743,84 +813,139 @@ private fun MessageBubble(
             }
         }
     } else {
+        // Replies sit on the page itself, Claude-style: no bubble, full width, easy to read.
         val parsed = remember(message.text) { ResponseParser.parse(message.text) }
         val thinkingLive = message.isStreaming && parsed.hasThinking && !parsed.isThinkingComplete
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-            PersonaAvatar(persona, size = 28.dp, modifier = Modifier.padding(top = 2.dp))
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (parsed.hasThinking) {
-                    ThinkingBlock(
-                        messageId = message.id,
-                        thinking = parsed.thinking.orEmpty(),
-                        isLive = thinkingLive,
-                        isComplete = parsed.isThinkingComplete,
-                        startedAt = message.createdAt,
-                        thinkingMillis = message.thinkingMillis
-                    )
-                }
-                val showTyping = message.isStreaming && parsed.answer.isBlank() && !thinkingLive
-                if (parsed.answer.isNotBlank() || showTyping || (!parsed.hasThinking && message.text.isNotBlank())) {
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(6.dp, 22.dp, 22.dp, 22.dp))
-                            .background(
-                                if (message.isError) MaterialTheme.colorScheme.errorContainer
-                                else MaterialTheme.colorScheme.surfaceContainerHigh
-                            )
-                            .combinedClickable(
-                                onClick = {},
-                                onLongClick = { if (parsed.answer.isNotBlank()) copy(parsed.answer) }
-                            )
-                            .padding(horizontal = 16.dp, vertical = 11.dp)
-                    ) {
-                        when {
-                            showTyping -> TypingIndicator()
-                            message.isError -> Text(
-                                message.text,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
-                            else -> MarkdownText(parsed.answer.ifBlank { message.text })
-                        }
-                    }
-                }
-                if (message.sources.isNotEmpty() && !message.isError) SourceCards(message.sources)
-                if (!message.isStreaming && !message.isError && parsed.answer.isNotBlank()) {
+        val answer = parsed.answer.ifBlank { if (parsed.hasThinking) "" else message.text }
+        val reveal = rememberSmoothReveal(message.id, answer, message.isStreaming)
+        val shown = answer.take(reveal.visible)
+        // Still typing out, either because tokens are arriving or the reveal is catching up.
+        val settling = message.isStreaming || !reveal.isIdle || reveal.visible < answer.length
+
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .messageEntrance(message.createdAt, fromEnd = false)
+                .combinedClickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {},
+                    onLongClick = { if (answer.isNotBlank()) copy(answer) }
+                ),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (parsed.hasThinking) {
+                ThinkingBlock(
+                    messageId = message.id,
+                    thinking = parsed.thinking.orEmpty(),
+                    isLive = thinkingLive,
+                    isComplete = parsed.isThinkingComplete,
+                    startedAt = message.createdAt,
+                    thinkingMillis = message.thinkingMillis
+                )
+            }
+            when {
+                message.isError -> ErrorNote(message.text)
+                shown.isNotEmpty() -> MarkdownText(
+                    shown,
+                    style = MaterialTheme.typography.bodyLarge.copy(lineHeight = 26.sp),
+                    fadeChars = reveal.fade
+                )
+            }
+            AnimatedVisibility(
+                visible = message.isStreaming && !thinkingLive,
+                enter = fadeIn(tween(220)),
+                exit = fadeOut(tween(320))
+            ) {
+                StreamingSpark(Modifier.padding(top = 2.dp))
+            }
+            if (message.sources.isNotEmpty() && !message.isError && !settling) SourceCards(message.sources)
+            AnimatedVisibility(
+                visible = !settling && !message.isError && answer.isNotBlank(),
+                enter = fadeIn(tween(300, delayMillis = 80)) + slideInVertically(tween(300, delayMillis = 80)) { it / 3 },
+                exit = fadeOut(tween(150))
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    CopyReplyButton(onClick = { copy(answer) })
                     ReadAloudButton(speaking, onReadAloud)
                 }
-                val skill = message.skill
-                if (skill != null && !message.isStreaming && !message.isError && parsed.answer.isNotBlank()) {
-                    SkillReplyActions(message, skill, parsed.answer)
-                }
             }
-            Spacer(Modifier.width(24.dp))
+            val skill = message.skill
+            if (skill != null && !settling && !message.isError && answer.isNotBlank()) {
+                SkillReplyActions(message, skill, answer)
+            }
         }
     }
 }
 
 @Composable
-private fun TypingIndicator() {
-    val transition = rememberInfiniteTransition(label = "typing")
-    Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.padding(vertical = 6.dp)) {
-        repeat(3) { index ->
-            val alpha by transition.animateFloat(
-                initialValue = 0.25f,
-                targetValue = 1f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = 500, delayMillis = index * 160),
-                    repeatMode = RepeatMode.Reverse
-                ),
-                label = "dot$index"
-            )
-            Box(
-                Modifier
-                    .size(8.dp)
-                    .alpha(alpha)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.onSurfaceVariant)
-            )
+private fun ErrorNote(text: String) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Icon(
+            Icons.Outlined.ErrorOutline,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(top = 1.dp).size(18.dp)
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+    }
+}
+
+/** A slowly turning, breathing spark shown while a reply is being written. */
+@Composable
+private fun StreamingSpark(modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "spark")
+    val rotation by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(tween(2_400, easing = LinearEasing)),
+        label = "sparkRotation"
+    )
+    val breath by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "sparkBreath"
+    )
+    Icon(
+        Icons.Default.AutoAwesome,
+        contentDescription = "Writing",
+        tint = MaterialTheme.colorScheme.primary,
+        modifier = modifier
+            .size(22.dp)
+            .graphicsLayer {
+                rotationZ = rotation
+                val scale = 0.8f + 0.25f * breath
+                scaleX = scale
+                scaleY = scale
+                alpha = 0.55f + 0.45f * breath
+            }
+    )
+}
+
+@Composable
+private fun CopyReplyButton(onClick: () -> Unit) {
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            kotlinx.coroutines.delay(1_500)
+            copied = false
         }
+    }
+    IconButton(onClick = { onClick(); copied = true }, modifier = Modifier.size(34.dp)) {
+        Icon(
+            if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+            contentDescription = "Copy reply",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp)
+        )
     }
 }
 

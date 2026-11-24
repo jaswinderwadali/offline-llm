@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import ai.impact.HubResolveState
 import ai.impact.HubSearchState
+import ai.impact.image.AuxOption
+import ai.impact.image.AuxResolution
 import ai.impact.image.GgufFile
 import ai.impact.image.GgufResolution
 import ai.impact.image.HubCandidate
@@ -111,8 +113,47 @@ private val QUICK_SEARCHES = mapOf(
         QuickSearch("Gemma", "gemma"),
         QuickSearch("Phi", "phi"),
         QuickSearch("SmolLM", "smollm")
+    ),
+    ModelKind.Search to listOf(
+        QuickSearch("MiniLM", "MiniLM"),
+        QuickSearch("BGE", "bge-small"),
+        QuickSearch("GTE", "gte-small"),
+        QuickSearch("Arctic Embed", "snowflake-arctic-embed"),
+        QuickSearch("E5", "e5-small")
+    ),
+    ModelKind.Listen to listOf(
+        QuickSearch("All Whisper", "whisper"),
+        QuickSearch("Tiny", "whisper-tiny"),
+        QuickSearch("Base", "whisper-base"),
+        QuickSearch("Small", "whisper-small"),
+        QuickSearch("Distil", "distil-whisper")
+    ),
+    ModelKind.Speak to listOf(
+        QuickSearch("All voices", "mms-tts"),
+        QuickSearch("Hindi", "mms-tts-hin"),
+        QuickSearch("Spanish", "mms-tts-spa"),
+        QuickSearch("French", "mms-tts-fra"),
+        QuickSearch("German", "mms-tts-deu"),
+        QuickSearch("Portuguese", "mms-tts-por")
     )
 )
+
+/** The screen's title and what it searches, per kind. */
+private fun ModelKind.title() = when (this) {
+    ModelKind.Chat -> "Chat models"
+    ModelKind.Image -> "Image models"
+    ModelKind.Search -> "Document search models"
+    ModelKind.Listen -> "Speech to text models"
+    ModelKind.Speak -> "Text to speech voices"
+}
+
+private fun ModelKind.subtitle() = when (this) {
+    ModelKind.Chat -> "Hugging Face · GGUF, up to 4B parameters"
+    ModelKind.Image -> "Hugging Face · Stable Diffusion ONNX"
+    ModelKind.Search -> "Hugging Face · BERT-style ONNX embedders"
+    ModelKind.Listen -> "Hugging Face · Whisper ONNX"
+    ModelKind.Speak -> "Hugging Face · MMS / VITS ONNX voices"
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -130,7 +171,8 @@ fun HuggingFaceScreen(
     onRetryResolve: (RepoRef) -> Unit,
     onDismissResolve: () -> Unit,
     onDownloadImage: (HubCandidate) -> Unit,
-    onDownloadChat: (GgufFile) -> Unit
+    onDownloadChat: (GgufFile) -> Unit,
+    onDownloadAux: (AuxOption) -> Unit
 ) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
@@ -156,9 +198,9 @@ fun HuggingFaceScreen(
             TopAppBar(
                 title = {
                     Column {
-                        Text(if (kind == ModelKind.Chat) "Chat models" else "Image models")
+                        Text(kind.title())
                         Text(
-                            if (kind == ModelKind.Chat) "Hugging Face · GGUF, up to 4B parameters" else "Hugging Face · Stable Diffusion ONNX",
+                            kind.subtitle(),
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -227,7 +269,11 @@ fun HuggingFaceScreen(
                     action = { OutlinedButton(onClick = { onSearch(search.query) }) { Text("Try again") } }
                 )
                 search.loaded && search.results.isEmpty() && !search.loading -> CenteredMessage(
-                    title = if (kind == ModelKind.Chat) "No small GGUF models found" else "No ONNX image models found",
+                    title = when (kind) {
+                        ModelKind.Chat -> "No small GGUF models found"
+                        ModelKind.Image -> "No ONNX image models found"
+                        else -> "No ONNX models found"
+                    },
                     body = if (kind == ModelKind.Chat) {
                         "Try another word, or paste a link to a model repo. Adding \"gguf\" to a model's name often finds a version that runs here."
                     } else {
@@ -268,6 +314,7 @@ fun HuggingFaceScreen(
             fitsInMemory = fitsInMemory,
             onDownloadImage = onDownloadImage,
             onDownloadChat = onDownloadChat,
+            onDownloadAux = onDownloadAux,
             onRetry = onRetryResolve,
             onOpenPage = ::openRepoPage,
             onDismiss = onDismissResolve
@@ -354,6 +401,7 @@ private fun ResolveSheet(
     fitsInMemory: (Long) -> Boolean,
     onDownloadImage: (HubCandidate) -> Unit,
     onDownloadChat: (GgufFile) -> Unit,
+    onDownloadAux: (AuxOption) -> Unit,
     onRetry: (RepoRef) -> Unit,
     onOpenPage: (String) -> Unit,
     onDismiss: () -> Unit
@@ -379,6 +427,10 @@ private fun ResolveSheet(
                 is HubResolveState.ChatResult -> when (val r = state.resolution) {
                     is GgufResolution.Found -> r.repo
                     is GgufResolution.Unsupported -> r.repo
+                }
+                is HubResolveState.AuxResult -> when (val r = state.resolution) {
+                    is AuxResolution.Found -> r.repo
+                    is AuxResolution.Unsupported -> r.repo
                 }
                 is HubResolveState.Failed -> state.ref.repo
             }
@@ -449,6 +501,29 @@ private fun ResolveSheet(
                             )
                             Spacer(Modifier.height(8.dp))
                         }
+                    }
+                }
+                is HubResolveState.AuxResult -> when (val r = state.resolution) {
+                    is AuxResolution.Unsupported -> Notice(Icons.Default.WarningAmber, r.reason, MaterialTheme.colorScheme.error)
+                    is AuxResolution.Found -> {
+                        Text(
+                            if (r.options.size == 1) "Ready to download" else "Choose a version (${r.options.size})",
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        r.options.forEachIndexed { index, option ->
+                            OptionRow(
+                                title = option.label,
+                                subtitle = "${formatBytes(option.sizeBytes)} · ${option.files.first().first.substringAfterLast('/')}",
+                                badge = if (index == 0 && r.options.size > 1) "Recommended" else null,
+                                installed = option.id in installedIds,
+                                downloading = option.id in downloadingIds,
+                                fits = fitsInMemory(option.sizeBytes),
+                                onDownload = { onDownloadAux(option) }
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Footnote("Only the files needed to run it on-device are downloaded.")
                     }
                 }
             }

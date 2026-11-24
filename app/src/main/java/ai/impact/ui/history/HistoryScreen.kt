@@ -74,12 +74,12 @@ fun HistoryScreen(
     activeConversationId: Long?,
     onOpen: (Long) -> Unit,
     onDelete: (Long) -> Unit,
+    onRename: (Long, String) -> Unit,
     onClearAll: () -> Unit,
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
     var query by rememberSaveable { mutableStateOf("") }
-    var pendingDelete by remember { mutableStateOf<ConversationSummary?>(null) }
     var confirmClearAll by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -180,30 +180,18 @@ fun HistoryScreen(
                     )
                 }
                 items(items, key = { it.id }) { conversation ->
-                    ConversationRow(
+                    ChatCard(
                         conversation = conversation,
                         persona = personaById[conversation.personaId],
                         isActive = conversation.id == activeConversationId,
-                        onClick = { onOpen(conversation.id) },
-                        onDelete = { pendingDelete = conversation }
+                        onOpen = { onOpen(conversation.id) },
+                        onRename = { onRename(conversation.id, it) },
+                        onDelete = { onDelete(conversation.id) },
+                        modifier = Modifier.animateItem()
                     )
                 }
             }
         }
-    }
-
-    pendingDelete?.let { conversation ->
-        AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete conversation?") },
-            text = { Text("\"${conversation.title}\" will be permanently deleted. Your saved memories are not affected.") },
-            confirmButton = {
-                TextButton(onClick = { onDelete(conversation.id); pendingDelete = null }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } }
-        )
     }
 
     if (confirmClearAll) {
@@ -218,78 +206,6 @@ fun HistoryScreen(
             },
             dismissButton = { TextButton(onClick = { confirmClearAll = false }) { Text("Cancel") } }
         )
-    }
-}
-
-@Composable
-private fun ConversationRow(
-    conversation: ConversationSummary,
-    persona: Persona?,
-    isActive: Boolean,
-    onClick: () -> Unit,
-    onDelete: () -> Unit
-) {
-    var menuOpen by remember { mutableStateOf(false) }
-    Surface(
-        onClick = onClick,
-        shape = MaterialTheme.shapes.large,
-        color = if (isActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.07f) else MaterialTheme.colorScheme.surface,
-        border = BorderStroke(
-            1.dp,
-            if (isActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.4f) else MaterialTheme.colorScheme.outlineVariant
-        ),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(Modifier.padding(start = 14.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (persona != null) PersonaAvatar(persona, size = 44.dp)
-            else EmojiAvatar("💬", Brush.linearGradient(listOf(Color(0xFF8A9BBF), Color(0xFF5A6B8C))), size = 44.dp)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        conversation.title,
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    if (isActive) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "OPEN",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "${persona?.name ?: "Removed personality"} · ${previewOf(conversation.lastMessage)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "${relativeTime(conversation.updatedAt)} · ${conversation.messageCount} messages",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-                )
-            }
-            Box {
-                IconButton(onClick = { menuOpen = true }) {
-                    Icon(Icons.Default.MoreVert, contentDescription = "Conversation options", modifier = Modifier.size(20.dp))
-                }
-                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(
-                        text = { Text("Delete") },
-                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) },
-                        onClick = { menuOpen = false; onDelete() }
-                    )
-                }
-            }
-        }
     }
 }
 

@@ -6,6 +6,7 @@ import ai.onnxruntime.OrtSession
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.util.Log
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
@@ -25,6 +26,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -42,9 +44,10 @@ class SpeechException(message: String) : Exception(message)
 interface Listener {
     /**
      * Listens until the user stops talking and returns what they said, or "" when they said
-     * nothing. [onLevel] gets loudness from 0 to 1; [onPartial] gets text as it's recognised.
+     * nothing. [onLevel] gets loudness from 0 to 1; [onPartial] gets text as it's recognised;
+     * [onFinished] runs once they've stopped talking, before any remaining recognition work.
      */
-    suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit): String
+    suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit, onFinished: () -> Unit): String
 
     /** Stops listening early; what's been heard so far is still returned. */
     fun finish()
@@ -75,31 +78,49 @@ class SystemListener(private val context: Context) : Listener {
     private var recognizer: SpeechRecognizer? = null
     @Volatile private var finishRequested = false
 
-    /** One stretch of speech the recognizer heard, and when the speaker went quiet. */
-    private class Segment(val text: String, val heardSpeech: Boolean, val quietSince: Long)
+    /**
+     * One stretch of speech the recognizer heard, and when the speaker went quiet. [error] is set
+     * when the recognizer gave up for its own reasons (busy, a hiccup), which is worth retrying.
+     */
+    private class Segment(val text: String, val heardSpeech: Boolean, val quietSince: Long, val error: String? = null)
 
     /**
      * Listens until the user has been quiet for [SpeechPause.MILLIS]. Recognizers often stop at
      * the first short pause whatever they're asked, so a stop that comes sooner starts a new
      * stretch, and the words are joined into one message.
      */
-    override suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit): String = withContext(Dispatchers.Main) {
+    override suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit, onFinished: () -> Unit): String = withContext(Dispatchers.Main) {
         if (!isAvailable(context)) {
             throw SpeechException("This phone has no offline speech recognizer. Download Whisper in the Models tab.")
         }
         finishRequested = false
         val parts = ArrayList<String>()
         fun joined(extra: String = "") = (parts + extra).filter { it.isNotBlank() }.joinToString(" ")
+        // Recognizers often give up within a second of starting: no match on a cough or the tail of
+        // the voice, or busy while the last session shuts down. Until the user has said something,
+        // quietly start again, so listening never just ends on them.
+        val waitUntil = System.currentTimeMillis() + SpeechPause.WAIT_FOR_SPEECH_MILLIS
         var segment = listenOnce(onLevel, { onPartial(joined(it)) }, startWithinMillis = null)
+        var onlyErrors = segment.error != null
+        while (segment.text.isBlank() && !finishRequested && System.currentTimeMillis() < waitUntil) {
+            // A busy recognizer needs a moment to let go of the microphone.
+            delay(if (segment.error != null) 400L else 150L)
+            segment = listenOnce(onLevel, { onPartial(joined(it)) }, startWithinMillis = null)
+            if (segment.error == null) onlyErrors = false
+        }
+        // It never worked at all, so say why rather than pretend the user was silent.
+        if (segment.text.isBlank() && onlyErrors && segment.error != null) throw SpeechException(segment.error)
         if (segment.text.isNotBlank()) parts.add(segment.text)
         while (parts.isNotEmpty() && !finishRequested) {
             // How much of the pause is left since the user went quiet.
             val left = SpeechPause.MILLIS - (System.currentTimeMillis() - segment.quietSince)
             if (left <= 0) break
             segment = listenOnce(onLevel, { onPartial(joined(it)) }, startWithinMillis = left)
-            if (!segment.heardSpeech) break
+            // Noise with no words (a fan, a TV) ends the turn rather than keeping it open.
+            if (!segment.heardSpeech || segment.text.isBlank()) break
             if (segment.text.isNotBlank()) parts.add(segment.text)
         }
+        if (parts.isNotEmpty()) onFinished()
         joined()
     }
 
@@ -143,7 +164,13 @@ class SystemListener(private val context: Context) : Listener {
                 override fun onReadyForSpeech(params: Bundle?) = Unit
                 override fun onBeginningOfSpeech() { began = true }
                 // About -2 dB in silence to 10 dB when speaking.
-                override fun onRmsChanged(rmsdB: Float) = onLevel(((rmsdB + 2f) / 12f).coerceIn(0f, 1f))
+                override fun onRmsChanged(rmsdB: Float) {
+                    val level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                    // The pause is timed from the last time the user was actually heard: not every
+                    // recognizer reports the end of speech, and some report it early.
+                    if (level > VOICE_LEVEL) quietSince = System.currentTimeMillis()
+                    onLevel(level)
+                }
                 override fun onBufferReceived(buffer: ByteArray?) = Unit
                 override fun onEndOfSpeech() {
                     quietSince = System.currentTimeMillis()
@@ -153,6 +180,8 @@ class SystemListener(private val context: Context) : Listener {
                 override fun onPartialResults(results: Bundle?) {
                     results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let {
                         if (it.isNotBlank()) began = true
+                        // New words mean they're still talking.
+                        if (it != partial) quietSince = System.currentTimeMillis()
                         partial = it
                         onPartial(it)
                     }
@@ -177,9 +206,13 @@ class SystemListener(private val context: Context) : Listener {
                             }
                             cont.resumeWithException(SpeechException("Your phone is downloading its offline speech pack. Try again in a minute, or use Whisper."))
                         }
-                        else -> {
-                            done(); cont.resumeWithException(SpeechException("The phone's speech recognizer stopped (error $error). Try again, or use Whisper."))
-                        }
+                        // Busy, a dropped connection to the recognizer service, an audio hiccup: retried.
+                        else -> finishWith(
+                            Segment(
+                                partial.trim(), began && partial.isNotBlank(), quietSince,
+                                error = "The phone's speech recognizer isn't responding (error $error). Try again, or use Whisper."
+                            )
+                        )
                     }
                 }
             })
@@ -202,7 +235,12 @@ class SystemListener(private val context: Context) : Listener {
 /** How long the user has to be quiet before voice mode takes it they've finished. */
 object SpeechPause {
     const val MILLIS = 3_000
+    /** How long to keep listening for the user to start talking before taking it as silence. */
+    const val WAIT_FOR_SPEECH_MILLIS = 10_000L
 }
+
+/** Loudness (0 to 1) above which the phone's recognizer is taken to be hearing speech. */
+private const val VOICE_LEVEL = 0.35f
 
 /** The phone's own voice, restricted to voices that work offline. */
 class SystemSpeaker(context: Context) : Speaker {
@@ -288,7 +326,7 @@ class MicRecorder(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    suspend fun record(onLevel: (Float) -> Unit): FloatArray? = withContext(Dispatchers.IO) {
+    suspend fun record(onLevel: (Float) -> Unit, onFinished: () -> Unit = {}): FloatArray? = withContext(Dispatchers.IO) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             throw SpeechException("TinyAI needs microphone access to listen.")
         }
@@ -330,6 +368,10 @@ class MicRecorder(private val context: Context) {
                     }
                     SpeechDetector.State.Done -> {
                         audio.add(chunk)
+                        // The pause that ended the turn is silence; keeping a third of a second of it
+                        // gives Whisper a clean ending without the work (and made-up words) of three.
+                        val trailing = (detector.trailingSilentFrames - 10).coerceIn(0, audio.size - 1)
+                        repeat(trailing) { audio.removeAt(audio.lastIndex) }
                         break
                     }
                     SpeechDetector.State.NoSpeech -> return@withContext null
@@ -339,7 +381,9 @@ class MicRecorder(private val context: Context) {
             runCatching { record.stop() }
             record.release()
             onLevel(0f)
+            Log.i("MicRecorder", "Listening ended: ${detector.summary()} finishRequested=$finishRequested")
         }
+        onFinished()
         val total = audio.sumOf { it.size }
         FloatArray(total).also { out -> var at = 0; audio.forEach { it.copyInto(out, at); at += it.size } }
     }
@@ -354,6 +398,7 @@ class WhisperListener(private val context: Context, private val dir: File) : Lis
     private lateinit var vocab: WhisperVocab
     private var startId = 0
     private var noTimestampsId = 0
+    private var prompt: List<Int> = emptyList()
     private var endId = 0
     private var suppress = IntArray(0)
     private var beginSuppress = IntArray(0)
@@ -382,13 +427,24 @@ class WhisperListener(private val context: Context, private val dir: File) : Lis
             is Number -> eos.toInt()
             else -> 50256
         }
+        // Multilingual models are told the language and task up front; English-only ones need neither.
+        prompt = buildList {
+            add(startId)
+            val languages = gen.optJSONObject("lang_to_id")
+            if (gen.optBoolean("is_multilingual", false) && languages != null) {
+                val language = "<|${Locale.getDefault().language}|>"
+                add(if (languages.has(language)) languages.getInt(language) else languages.optInt("<|en|>", startId + 1))
+                gen.optJSONObject("task_to_id")?.optInt("transcribe")?.takeIf { it > 0 }?.let(::add)
+            }
+            add(noTimestampsId)
+        }
         suppress = gen.optJSONArray("suppress_tokens")?.let { a -> IntArray(a.length()) { a.getInt(it) } } ?: IntArray(0)
         beginSuppress = gen.optJSONArray("begin_suppress_tokens")?.let { a -> IntArray(a.length()) { a.getInt(it) } } ?: IntArray(0)
     }
 
-    override suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit): String {
+    override suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit, onFinished: () -> Unit): String {
         withContext(Dispatchers.Default) { load() }
-        val audio = mic.record(onLevel) ?: return ""
+        val audio = mic.record(onLevel, onFinished) ?: return ""
         onPartial("…")
         return withContext(Dispatchers.Default) { transcribe(audio) }
     }
@@ -408,7 +464,7 @@ class WhisperListener(private val context: Context, private val dir: File) : Lis
                 OnnxTensor.createTensor(env, FloatBuffer.wrap(data), shape)
             }
         }
-        val tokens = arrayListOf(startId, noTimestampsId)
+        val tokens = ArrayList(prompt)
         hidden.use {
             for (step in 0 until 120) {
                 val ids = LongArray(tokens.size) { tokens[it].toLong() }
@@ -429,7 +485,7 @@ class WhisperListener(private val context: Context, private val dir: File) : Lis
                 tokens.add(next)
             }
         }
-        return vocab.decode(tokens.drop(2))
+        return vocab.decode(tokens.drop(prompt.size))
     }
 
     override fun finish() = mic.finish()

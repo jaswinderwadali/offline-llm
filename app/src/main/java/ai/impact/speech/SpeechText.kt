@@ -2,6 +2,7 @@ package ai.impact.speech
 
 import org.json.JSONObject
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -120,6 +121,9 @@ object SpeakableText {
  * Decides when someone has started and stopped talking, from the loudness of short audio frames.
  * It learns the room's background level first, so it works in a quiet room and a noisy one.
  */
+/** Loudest background the detector will assume; anything louder at the start is likely speech. */
+private const val NOISE_CAP = 0.02
+
 class SpeechDetector(
     private val frameMillis: Int = 30,
     /** How long a pause ends the utterance: three seconds, so a moment to think doesn't cut the user off. */
@@ -144,14 +148,34 @@ class SpeechDetector(
         return sqrt(sum / max(1, count))
     }
 
+    /** Quiet frames since the user last spoke; the end of a finished turn is this much silence. */
+    val trailingSilentFrames: Int get() = silentFrames
+
+    private var peak = 0.0
+    private val startThreshold: Double get() = max(0.012, noise * 3.0)
+    private val keepThreshold: Double get() = max(0.007, noise * 1.8)
+
+    /** The levels it decided on, for the log when something seems off. */
+    fun summary(): String = "state=$state frames=$frames noise=%.4f start=%.4f keep=%.4f peak=%.4f speech=%dms"
+        .format(noise, startThreshold, keepThreshold, peak, speechFrames * frameMillis)
+
     /** Feeds one frame's loudness; returns the new state. */
     fun feed(level: Double): State {
         if (state == State.Done || state == State.NoSpeech) return state
         frames++
-        // The first quarter second sets the background level; it then drifts slowly with the room.
-        noise = if (frames <= 8) max(noise, level) else if (state == State.Waiting) noise * 0.95 + level * 0.05 else noise
-        val threshold = max(0.012, noise * 2.5)
-        val loud = level > threshold
+        peak = max(peak, level)
+        // The background level follows the quietest sound quickly but rises only very slowly, so a
+        // soft start or the user's own voice can't raise it (which would make their speech look
+        // like silence). It's frozen while they talk, and capped.
+        if (state == State.Waiting) {
+            noise = when {
+                frames == 1 -> min(level, NOISE_CAP)
+                level < noise -> noise * 0.6 + level * 0.4
+                else -> min(noise * 0.995 + level * 0.005, NOISE_CAP)
+            }
+        }
+        // Starting a turn takes a clear sound; carrying on needs only ordinary, softer speech.
+        val loud = if (state == State.Waiting) level > startThreshold else level > keepThreshold
         when (state) {
             State.Waiting -> {
                 speechFrames = if (loud) speechFrames + 1 else 0

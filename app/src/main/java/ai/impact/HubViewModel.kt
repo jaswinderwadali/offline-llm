@@ -3,6 +3,9 @@ package ai.impact
 import android.app.ActivityManager
 import android.app.Application
 import android.util.Log
+import ai.impact.image.AuxOption
+import ai.impact.image.AuxResolution
+import ai.impact.models.AuxKind
 import ai.impact.image.GgufFile
 import ai.impact.image.GgufResolution
 import ai.impact.image.HubCandidate
@@ -37,16 +40,20 @@ sealed interface HubResolveState {
     data class Checking(val repo: String) : HubResolveState
     data class ImageResult(val resolution: HubResolution) : HubResolveState
     data class ChatResult(val resolution: GgufResolution) : HubResolveState
+    data class AuxResult(val resolution: AuxResolution) : HubResolveState
     data class Failed(val ref: RepoRef, val message: String) : HubResolveState
 }
 
-/** Browsing Hugging Face for chat (GGUF) and image (ONNX) models, and queuing their downloads. */
+/** Browsing Hugging Face for chat (GGUF), image, search and speech (ONNX) models, and queuing their downloads. */
 class HubViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "HubViewModel"
         /** First searches shown: small instruct chat models, and quantised SD 1.5 image models. */
-        val DEFAULT_QUERY = mapOf(ModelKind.Chat to "instruct", ModelKind.Image to "int8")
+        val DEFAULT_QUERY = mapOf(
+            ModelKind.Chat to "instruct", ModelKind.Image to "int8",
+            ModelKind.Search to "MiniLM", ModelKind.Listen to "whisper", ModelKind.Speak to "mms-tts"
+        )
         private const val MAX_MODEL_RAM_FRACTION = 0.6
     }
 
@@ -121,6 +128,7 @@ class HubViewModel(application: Application) : AndroidViewModel(application) {
                 when (kind) {
                     ModelKind.Image -> HubResolveState.ImageResult(client.resolve(ref))
                     ModelKind.Chat -> HubResolveState.ChatResult(client.resolveGguf(ref))
+                    else -> HubResolveState.AuxResult(client.resolveAux(ref, kind.aux!!))
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -140,6 +148,13 @@ class HubViewModel(application: Application) : AndroidViewModel(application) {
     fun download(candidate: HubCandidate): Boolean = queued(app.imageModels.startDownload(candidate.toDownloadSpec()))
 
     fun download(file: GgufFile): Boolean = queued(app.textModels.startDownload(file.toDownloadSpec()))
+
+    fun download(option: AuxOption): Boolean = queued(
+        when (option.kind) {
+            AuxKind.Search -> app.searchModel.store.startDownload(option.toDownloadSpec())
+            AuxKind.Listen, AuxKind.Speak -> app.speech.models.startDownload(option.toDownloadSpec())
+        }
+    )
 
     private fun queued(error: String?): Boolean {
         if (error != null) {

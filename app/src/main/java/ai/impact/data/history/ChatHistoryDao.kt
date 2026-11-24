@@ -46,6 +46,9 @@ interface ChatHistoryDao {
     @Insert
     suspend fun insertMessage(message: MessageEntity): Long
 
+    @Query("UPDATE conversations SET title = :title WHERE id = :id")
+    suspend fun rename(id: Long, title: String)
+
     @Query("UPDATE conversations SET updatedAt = :updatedAt WHERE id = :id")
     suspend fun touch(id: Long, updatedAt: Long)
 

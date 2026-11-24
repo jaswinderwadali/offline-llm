@@ -1,6 +1,17 @@
 package ai.impact.ui.chat
 
 import android.widget.Toast
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -57,7 +68,11 @@ sealed interface MdBlock {
     data class Paragraph(val text: String) : MdBlock
     data class ListItem(val ordered: Boolean, val marker: String, val indent: Int, val text: String) : MdBlock
     data class Quote(val text: String) : MdBlock
-    data class Code(val language: String, val code: String) : MdBlock
+    data class Code(val language: String, val code: String) : MdBlock {
+        /** False while it's still streaming in (no closing fence yet); a preview waits for the whole page. */
+        var closed: Boolean = true
+            internal set
+    }
     data object Rule : MdBlock
 }
 
@@ -66,6 +81,7 @@ private val bulletRegex = Regex("^(\\s*)[-*+•]\\s+(.*)$")
 private val orderedRegex = Regex("^(\\s*)(\\d{1,3})[.)]\\s+(.*)$")
 private val ruleRegex = Regex("^\\s*([-*_])(\\s*\\1){2,}\\s*$")
 private val fenceRegex = Regex("^\\s*(```|~~~)\\s*([\\w+#.-]*)\\s*$")
+private val htmlStartRegex = Regex("^\\s*(<!doctype\\s+html|<html[\\s>])", RegexOption.IGNORE_CASE)
 
 /** Line-based markdown parser. Tolerates half-streamed input (e.g. an unclosed code fence). */
 fun parseMarkdown(text: String): List<MdBlock> {
@@ -98,7 +114,20 @@ fun parseMarkdown(text: String): List<MdBlock> {
                     code.append(lines[i])
                     i++
                 }
-                blocks += MdBlock.Code(fence.groupValues[2], code.toString())
+                blocks += MdBlock.Code(fence.groupValues[2], code.toString()).apply { closed = i < lines.size }
+            }
+            // A whole HTML page written without a code fence would otherwise show as mangled paragraphs.
+            htmlStartRegex.containsMatchIn(line) -> {
+                flushParagraph(); flushQuote()
+                val code = StringBuilder()
+                var closed = false
+                while (i < lines.size) {
+                    if (code.isNotEmpty()) code.append('\n')
+                    code.append(lines[i])
+                    if (lines[i].contains("</html>", ignoreCase = true)) { closed = true; break }
+                    i++
+                }
+                blocks += MdBlock.Code("html", code.toString()).apply { this.closed = closed }
             }
             line.isBlank() -> { flushParagraph(); flushQuote() }
             ruleRegex.matches(line) -> { flushParagraph(); flushQuote(); blocks += MdBlock.Rule }
@@ -234,7 +263,9 @@ fun MarkdownText(
     text: String,
     modifier: Modifier = Modifier,
     color: Color = MaterialTheme.colorScheme.onSurface,
-    style: TextStyle = MaterialTheme.typography.bodyLarge
+    style: TextStyle = MaterialTheme.typography.bodyLarge,
+    /** Trailing characters still fading in while a reply streams (see [SmoothReveal]). */
+    fadeChars: Float = 0f
 ) {
     val blocks = remember(text) { parseMarkdown(text) }
     val colors = InlineColors(
@@ -242,12 +273,16 @@ fun MarkdownText(
         codeBackground = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
         link = MaterialTheme.colorScheme.primary
     )
+    val quoteColor = MaterialTheme.colorScheme.onSurfaceVariant
 
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        blocks.forEach { block ->
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        blocks.forEachIndexed { index, block ->
+            val isLast = index == blocks.lastIndex
+            fun inline(raw: String, ink: Color = color) =
+                parseInline(raw, colors).let { if (isLast) it.fadeTail(fadeChars, ink) else it }
             when (block) {
                 is MdBlock.Heading -> Text(
-                    parseInline(block.text, colors),
+                    inline(block.text),
                     color = color,
                     style = when (block.level) {
                         1 -> MaterialTheme.typography.titleLarge
@@ -256,9 +291,9 @@ fun MarkdownText(
                     }.copy(fontWeight = FontWeight.Bold),
                     modifier = Modifier.padding(top = 4.dp)
                 )
-                is MdBlock.Paragraph -> Text(parseInline(block.text, colors), color = color, style = style)
-                is MdBlock.ListItem -> ListItemRow(block, colors, color, style)
-                is MdBlock.Quote -> QuoteBlock(block, colors, style)
+                is MdBlock.Paragraph -> Text(inline(block.text), color = color, style = style)
+                is MdBlock.ListItem -> ListItemRow(block, inline(block.text), color, style)
+                is MdBlock.Quote -> QuoteBlock(inline(block.text, quoteColor), quoteColor, style)
                 is MdBlock.Code -> CodeBlock(block)
                 MdBlock.Rule -> HorizontalDivider(
                     Modifier.padding(vertical = 4.dp),
@@ -270,7 +305,7 @@ fun MarkdownText(
 }
 
 @Composable
-private fun ListItemRow(item: MdBlock.ListItem, colors: InlineColors, color: Color, style: TextStyle) {
+private fun ListItemRow(item: MdBlock.ListItem, text: AnnotatedString, color: Color, style: TextStyle) {
     Row(Modifier.padding(start = (item.indent * 16).dp)) {
         Box(Modifier.widthIn(min = 22.dp), contentAlignment = Alignment.TopStart) {
             Text(
@@ -281,12 +316,12 @@ private fun ListItemRow(item: MdBlock.ListItem, colors: InlineColors, color: Col
             )
         }
         Spacer(Modifier.width(4.dp))
-        Text(parseInline(item.text, colors), color = color, style = style)
+        Text(text, color = color, style = style)
     }
 }
 
 @Composable
-private fun QuoteBlock(quote: MdBlock.Quote, colors: InlineColors, style: TextStyle) {
+private fun QuoteBlock(text: AnnotatedString, color: Color, style: TextStyle) {
     Row(Modifier.height(IntrinsicSize.Min)) {
         Box(
             Modifier
@@ -296,11 +331,7 @@ private fun QuoteBlock(quote: MdBlock.Quote, colors: InlineColors, style: TextSt
                 .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
         )
         Spacer(Modifier.width(12.dp))
-        Text(
-            parseInline(quote.text, colors),
-            style = style.copy(fontStyle = FontStyle.Italic),
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Text(text, style = style.copy(fontStyle = FontStyle.Italic), color = color)
     }
 }
 
@@ -309,6 +340,10 @@ private fun CodeBlock(block: MdBlock.Code) {
     val context = LocalContext.current
     @Suppress("DEPRECATION")
     val clipboard = LocalClipboardManager.current
+    // Pages and drawings can be seen rendered, once they've finished streaming in.
+    val previewable = block.closed && isPreviewable(block.language, block.code)
+    var showPreview by rememberSaveable(block.code.hashCode()) { mutableStateOf(false) }
+    var fullScreen by remember { mutableStateOf(false) }
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -327,6 +362,12 @@ private fun CodeBlock(block: MdBlock.Code) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
                 )
+                if (previewable) {
+                    CodePreviewSwitch(showPreview, onChange = { showPreview = it })
+                    IconButton(onClick = { fullScreen = true }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.OpenInFull, contentDescription = "Open preview full screen", modifier = Modifier.size(16.dp))
+                    }
+                }
                 IconButton(
                     onClick = {
                         clipboard.setText(AnnotatedString(block.code))
@@ -338,14 +379,58 @@ private fun CodeBlock(block: MdBlock.Code) {
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            AnimatedContent(
+                targetState = previewable && showPreview,
+                transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(150)) },
+                label = "codePreview"
+            ) { preview ->
+                if (preview) {
+                    HtmlPreview(
+                        block.code,
+                        Modifier
+                            .fillMaxWidth()
+                            .height(380.dp)
+                            .clip(RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp))
+                    )
+                } else {
+                    Text(
+                        block.code,
+                        modifier = Modifier
+                            .horizontalScroll(rememberScrollState())
+                            .padding(14.dp),
+                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace, lineHeight = 20.sp),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        softWrap = false
+                    )
+                }
+            }
+        }
+    }
+    if (fullScreen) {
+        HtmlPreviewDialog(block.code, title = "${block.language.ifBlank { "html" }.uppercase()} preview", onDismiss = { fullScreen = false })
+    }
+}
+
+/** A small two-way switch between the source and the rendered page. */
+@Composable
+private fun CodePreviewSwitch(preview: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .padding(2.dp)
+    ) {
+        listOf(false to "Code", true to "Preview").forEach { (value, label) ->
+            val selected = preview == value
             Text(
-                block.code,
+                label,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
-                    .horizontalScroll(rememberScrollState())
-                    .padding(14.dp),
-                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace, lineHeight = 20.sp),
-                color = MaterialTheme.colorScheme.onSurface,
-                softWrap = false
+                    .clip(RoundedCornerShape(50))
+                    .background(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                    .clickable { onChange(value) }
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
             )
         }
     }

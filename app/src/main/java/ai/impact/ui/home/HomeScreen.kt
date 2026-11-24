@@ -5,8 +5,7 @@ import ai.impact.data.Persona
 import ai.impact.data.history.ConversationSummary
 import ai.impact.ui.components.PersonaAvatar
 import ai.impact.ui.components.brush
-import ai.impact.ui.history.previewOf
-import ai.impact.ui.history.relativeTime
+import ai.impact.ui.history.ChatCard
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -77,6 +76,7 @@ fun HomeScreen(
     onCreatePersona: () -> Unit,
     onOpenConversation: (Long) -> Unit,
     onDeleteConversation: (Long) -> Unit,
+    onRenameConversation: (Long, String) -> Unit,
     onSeeAllHistory: () -> Unit,
     onOpenModels: () -> Unit,
     onCreateImage: () -> Unit,
@@ -131,11 +131,13 @@ fun HomeScreen(
             item { EmptyChats() }
         } else {
             items(conversations.take(10), key = { it.id }) { conversation ->
-                ConversationCard(
+                ChatCard(
                     conversation = conversation,
                     persona = byId[conversation.personaId],
                     onOpen = { onOpenConversation(conversation.id) },
-                    onDelete = { onDeleteConversation(conversation.id) }
+                    onRename = { onRenameConversation(conversation.id, it) },
+                    onDelete = { onDeleteConversation(conversation.id) },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 5.dp).animateItem()
                 )
             }
         }
@@ -194,16 +196,19 @@ private fun StoriesRail(
 ) {
     LazyRow(
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        item { CreateStory(onCreate) }
         items(personas, key = { it.id }) { persona ->
             Story(persona, selected = persona.id == selectedId, ringed = persona.id in active, onClick = { onOpen(persona) })
         }
+        // Making a new one comes after everyone you already talk to.
+        item(key = "create") { CreateStory(onCreate) }
     }
 }
 
 private val StorySize = 74.dp
+/** Wider than the circle, so a name gets room on either side of it. */
+private val StoryWidth = 86.dp
 
 @Composable
 private fun Story(persona: Persona, selected: Boolean, ringed: Boolean, onClick: () -> Unit) {
@@ -212,7 +217,7 @@ private fun Story(persona: Persona, selected: Boolean, ringed: Boolean, onClick:
         else -> Brush.linearGradient(listOf(MaterialTheme.colorScheme.outlineVariant, MaterialTheme.colorScheme.outlineVariant))
     }
     Column(
-        Modifier.width(StorySize + 4.dp).clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = "Chat with ${persona.name}", onClick = onClick),
+        Modifier.width(StoryWidth).clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = "Chat with ${persona.name}", onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
@@ -222,12 +227,14 @@ private fun Story(persona: Persona, selected: Boolean, ringed: Boolean, onClick:
             PersonaAvatar(persona, size = StorySize - 10.dp)
         }
         Spacer(Modifier.height(6.dp))
+        // Two short lines fit names like "Mindfulness Guide" whole instead of cutting them off.
         Text(
             persona.name,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelMedium.copy(lineHeight = 15.sp),
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            maxLines = 2,
+            minLines = 2,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center
         )
@@ -237,7 +244,7 @@ private fun Story(persona: Persona, selected: Boolean, ringed: Boolean, onClick:
 @Composable
 private fun CreateStory(onClick: () -> Unit) {
     Column(
-        Modifier.width(StorySize + 4.dp).clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = "Create a personality", onClick = onClick),
+        Modifier.width(StoryWidth).clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = "Create a personality", onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
@@ -248,7 +255,13 @@ private fun CreateStory(onClick: () -> Unit) {
             Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(30.dp))
         }
         Spacer(Modifier.height(6.dp))
-        Text("Create", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(
+            "Create",
+            style = MaterialTheme.typography.labelMedium.copy(lineHeight = 15.sp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            minLines = 2,
+            textAlign = TextAlign.Center
+        )
     }
 }
 
@@ -259,70 +272,6 @@ private fun QuickAction(icon: ImageVector, title: String, subtitle: String, modi
             Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
             Text(title, style = MaterialTheme.typography.titleSmall)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun ConversationCard(conversation: ConversationSummary, persona: Persona?, onOpen: () -> Unit, onDelete: () -> Unit) {
-    var menuOpen by remember { mutableStateOf(false) }
-    val accent = persona?.brush() ?: Brush.linearGradient(listOf(MaterialTheme.colorScheme.outline, MaterialTheme.colorScheme.outline))
-    Box(Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainer, modifier = Modifier.fillMaxWidth()) {
-            Row(
-                Modifier
-                    .combinedClickable(onClick = onOpen, onLongClick = { menuOpen = true }, onLongClickLabel = "More options")
-                    .height(androidx.compose.foundation.layout.IntrinsicSize.Min)
-            ) {
-                // The personality's colours run down the edge, so chats are easy to tell apart.
-                Box(Modifier.width(5.dp).fillMaxHeight().background(accent))
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.Top) {
-                    if (persona != null) PersonaAvatar(persona, size = 44.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                conversation.title,
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(relativeTime(conversation.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Text(
-                            previewOf(conversation.lastMessage),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                persona?.name ?: "Removed personality",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = persona?.let { Color(it.colorStart) } ?: MaterialTheme.colorScheme.outline,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                " · ${conversation.messageCount} message${if (conversation.messageCount == 1) "" else "s"}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-            DropdownMenuItem(
-                text = { Text("Delete chat") },
-                leadingIcon = { Icon(Icons.Outlined.Delete, contentDescription = null) },
-                onClick = { menuOpen = false; onDelete() }
-            )
         }
     }
 }
@@ -345,13 +294,17 @@ private fun EmptyChats() {
     }
 }
 
+/** Always first in the rail, so the everyday helper is one tap away. */
+const val PINNED_PERSONA_ID = "assistant"
+
 /**
- * Personalities with the one chatted with most recently first, like stories. Ones never chatted
- * with keep their usual order after those.
+ * Personalities like stories: the Assistant pinned first, then the one chatted with most recently,
+ * and so on. Ones never chatted with keep their usual order after those.
  */
 fun byLastUse(personas: List<Persona>, conversations: List<ConversationSummary>): List<Persona> {
     val lastUsed = HashMap<String, Long>()
     conversations.forEach { c -> if (c.updatedAt > (lastUsed[c.personaId] ?: Long.MIN_VALUE)) lastUsed[c.personaId] = c.updatedAt }
     // sortedByDescending is stable, so unused personalities stay in their original order.
-    return personas.sortedByDescending { lastUsed[it.id] ?: Long.MIN_VALUE }
+    val (pinned, rest) = personas.partition { it.id == PINNED_PERSONA_ID }
+    return pinned + rest.sortedByDescending { lastUsed[it.id] ?: Long.MIN_VALUE }
 }

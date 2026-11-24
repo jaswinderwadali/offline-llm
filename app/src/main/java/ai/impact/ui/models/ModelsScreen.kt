@@ -11,6 +11,11 @@ import ai.impact.image.ModelImport
 import ai.impact.image.ModelKind
 import ai.impact.models.CatalogTextModel
 import ai.impact.models.InstalledTextModel
+import ai.impact.models.AuxCatalogModel
+import ai.impact.models.AuxImport
+import ai.impact.models.AuxKind
+import ai.impact.models.AuxSource
+import ai.impact.models.InstalledAuxModel
 import ai.impact.models.ModelDownload
 import ai.impact.models.formatBytes
 import ai.impact.ui.components.SectionHeader
@@ -55,6 +60,9 @@ import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Mic
+import androidx.compose.material.icons.outlined.RecordVoiceOver
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -65,7 +73,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.PrimaryScrollableTabRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
@@ -94,7 +102,43 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.Flow
 import java.util.Locale
 
-enum class ModelsTab(val label: String) { Chat("Chat"), Image("Image") }
+enum class ModelsTab(val label: String, val icon: ImageVector) {
+    Chat("Chat", Icons.Outlined.ChatBubbleOutline),
+    Image("Image", Icons.Outlined.Image),
+    Search("Documents", Icons.Outlined.Description),
+    Listen("Speech to text", Icons.Outlined.Mic),
+    Speak("Text to speech", Icons.Outlined.RecordVoiceOver)
+}
+
+/** The phone's own engine, offered alongside downloaded models (speech only). */
+class BuiltInEngine(val id: String, val name: String, val available: Boolean, val unavailableReason: String, val note: String)
+
+/** Everything a Documents, Speech to text or Text to speech tab shows and does. */
+class AuxModelsUi(
+    val kind: AuxKind,
+    val installed: List<InstalledAuxModel>,
+    /** The chosen model's id (or the built-in engine's), or null when there's none. */
+    val activeId: String?,
+    /** Whether the chosen downloaded model is in memory. */
+    val loaded: Boolean,
+    val builtIn: BuiltInEngine?,
+    val catalog: List<AuxCatalogModel>,
+    val downloads: Map<String, ModelDownload>,
+    val import: AuxImport?,
+    /** Something worth knowing under the status, like documents being re-scored. */
+    val note: String?,
+    val onDownload: (AuxCatalogModel) -> Unit,
+    val onCancelDownload: (String) -> Unit,
+    val onDismissDownloadError: (String) -> Unit,
+    val onUse: (String) -> Unit,
+    val onLoad: () -> Unit,
+    val onUnload: () -> Unit,
+    val onDelete: (InstalledAuxModel) -> Unit,
+    val onImport: () -> Unit,
+    val onCancelImport: () -> Unit
+) {
+    val ready: Boolean get() = (builtIn != null && activeId == builtIn.id && builtIn.available) || (activeId != null && installed.any { it.id == activeId })
+}
 
 /** Everything the Chat tab shows and does. */
 class ChatModelsUi(
@@ -143,6 +187,9 @@ fun ModelsScreen(
     deviceRamBytes: Long,
     chat: ChatModelsUi,
     image: ImageModelsUi,
+    search: AuxModelsUi,
+    listen: AuxModelsUi,
+    speak: AuxModelsUi,
     messages: Flow<String>,
     onOpenHub: (ModelKind) -> Unit,
     onBack: () -> Unit
@@ -172,14 +219,19 @@ fun ModelsScreen(
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
                 )
-                PrimaryTabRow(
+                // Five kinds don't fit across a phone, so the tabs scroll.
+                PrimaryScrollableTabRow(
                     selectedTabIndex = tab.ordinal,
-                    containerColor = MaterialTheme.colorScheme.background
+                    containerColor = MaterialTheme.colorScheme.background,
+                    edgePadding = 8.dp
                 ) {
                     ModelsTab.entries.forEach { entry ->
                         val ready = when (entry) {
                             ModelsTab.Chat -> chat.state is ModelState.Ready
                             ModelsTab.Image -> image.state is ImageModelState.Ready
+                            ModelsTab.Search -> search.ready
+                            ModelsTab.Listen -> listen.ready
+                            ModelsTab.Speak -> speak.ready
                         }
                         Tab(
                             selected = tab == entry,
@@ -200,7 +252,7 @@ fun ModelsScreen(
                             },
                             icon = {
                                 Icon(
-                                    if (entry == ModelsTab.Chat) Icons.Outlined.ChatBubbleOutline else Icons.Outlined.Image,
+                                    entry.icon,
                                     contentDescription = null,
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -231,6 +283,9 @@ fun ModelsScreen(
                 when (current) {
                     ModelsTab.Chat -> chatTab(chat, ramGb, onOpenHub = { onOpenHub(ModelKind.Chat) }, ask = { confirm = it })
                     ModelsTab.Image -> imageTab(image, ramGb, onOpenHub = { onOpenHub(ModelKind.Image) }, ask = { confirm = it }, openPage = ::openPage)
+                    ModelsTab.Search -> auxTab(search, ramGb, onOpenHub = { onOpenHub(ModelKind.Search) }, ask = { confirm = it }, openPage = ::openPage)
+                    ModelsTab.Listen -> auxTab(listen, ramGb, onOpenHub = { onOpenHub(ModelKind.Listen) }, ask = { confirm = it }, openPage = ::openPage)
+                    ModelsTab.Speak -> auxTab(speak, ramGb, onOpenHub = { onOpenHub(ModelKind.Speak) }, ask = { confirm = it }, openPage = ::openPage)
                 }
             }
         }
@@ -415,6 +470,141 @@ private fun LazyListScope.imageTab(
     item(key = "image-import") { ImportCard(ui.import, ui.onImport, ui.onCancelImport) }
 }
 
+private fun AuxKind.title() = when (this) {
+    AuxKind.Search -> "Document search model"
+    AuxKind.Listen -> "Speech to text"
+    AuxKind.Speak -> "Text to speech"
+}
+
+private fun AuxKind.hubBody() = when (this) {
+    AuxKind.Search -> "Search ONNX sentence embedders like MiniLM, BGE or GTE, or paste a link to any repo."
+    AuxKind.Listen -> "Search Whisper models exported to ONNX, or paste a link to any repo."
+    AuxKind.Speak -> "Search MMS voices for over 1,000 languages, or paste a link to any VITS ONNX repo."
+}
+
+private fun AuxKind.importBody() = when (this) {
+    AuxKind.Search -> "A BERT-style sentence embedder exported to ONNX. Pick the folder that contains:" to
+        "onnx/model_quantized.onnx (or model.onnx)\nvocab.txt"
+    AuxKind.Listen -> "A Whisper model exported to ONNX. Pick the folder that contains:" to
+        "onnx/encoder_model_quantized.onnx\nonnx/decoder_model_quantized.onnx\nvocab.json\ngeneration_config.json"
+    AuxKind.Speak -> "An MMS / VITS voice exported to ONNX. Pick the folder that contains:" to
+        "onnx/model_quantized.onnx (or model.onnx)\nvocab.json\nconfig.json"
+}
+
+private fun LazyListScope.auxTab(
+    ui: AuxModelsUi,
+    ramGb: Double,
+    onOpenHub: () -> Unit,
+    ask: (Confirm) -> Unit,
+    openPage: (String) -> Unit
+) {
+    val prefix = ui.kind.name
+    val active = ui.installed.firstOrNull { it.id == ui.activeId }
+    val usingBuiltIn = ui.builtIn != null && ui.activeId == ui.builtIn.id
+    item(key = "$prefix-status") {
+        val status = when {
+            usingBuiltIn && ui.builtIn!!.available -> Status.Ready(ui.builtIn.name, ui.builtIn.note)
+            usingBuiltIn -> Status.Failed(ui.builtIn!!.unavailableReason)
+            active != null && ui.loaded -> Status.Ready(active.name)
+            active != null -> Status.Standby(active.name)
+            else -> Status.Idle("No ${ui.kind.label} model yet", "Download one below, find one on Hugging Face, or load one from your phone.")
+        }
+        StatusCard(ui.kind.icon(), ui.kind.title(), status, ramGb, onUnload = ui.onUnload, onLoad = ui.onLoad)
+    }
+    ui.note?.let { note ->
+        item(key = "$prefix-note") {
+            Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 4.dp))
+        }
+    }
+
+    if (ui.installed.isNotEmpty() || ui.builtIn != null) {
+        item(key = "$prefix-installed-header") { SectionHeader("On this device", Modifier.padding(top = 8.dp)) }
+        ui.builtIn?.let { engine ->
+            item(key = "$prefix-builtin") {
+                InstalledRow(
+                    name = engine.name,
+                    details = if (engine.available) "Built into your phone · no download" else "Not available on this phone",
+                    selected = usingBuiltIn,
+                    loaded = usingBuiltIn && engine.available,
+                    loading = false,
+                    onUse = { ui.onUse(engine.id) },
+                    onUnload = null,
+                    onDelete = null,
+                    loadsOnDemand = true
+                )
+            }
+        }
+        items(ui.installed, key = { "$prefix-installed:${it.id}" }) { model ->
+            val selected = model.id == ui.activeId
+            InstalledRow(
+                name = model.name,
+                details = buildString {
+                    append(formatBytes(model.sizeBytes))
+                    when (model.source) {
+                        AuxSource.HuggingFace -> append(" · From Hugging Face")
+                        AuxSource.Imported -> append(" · Imported")
+                        AuxSource.Suggested -> Unit
+                    }
+                },
+                selected = selected,
+                loaded = selected && ui.loaded,
+                loading = false,
+                onUse = { ui.onUse(model.id) },
+                onUnload = ui.onUnload,
+                onDelete = {
+                    ask(Confirm.Delete(model.name, model.sizeBytes, "You can download it again any time.") { ui.onDelete(model) })
+                },
+                loadsOnDemand = true
+            )
+        }
+    }
+
+    val installedIds = ui.installed.map { it.id }.toSet()
+    customDownloads(ui.downloads.filterKeys { id -> ui.catalog.none { it.id == id } }, prefix, ui.onCancelDownload, ui.onDismissDownloadError)
+
+    val available = ui.catalog.filterNot { it.id in installedIds }
+    if (available.isNotEmpty()) {
+        item(key = "$prefix-catalog-header") { SectionHeader("Suggested", Modifier.padding(top = 8.dp)) }
+        items(available, key = { "$prefix-catalog:${it.id}" }) { model ->
+            CatalogCard(
+                name = model.name,
+                description = model.description,
+                recommended = model.recommended,
+                tags = listOf(formatBytes(model.sizeBytes), "ONNX"),
+                minRamGb = null,
+                ramGb = ramGb,
+                download = ui.downloads[model.id],
+                onDownload = { ask(Confirm.Download(model.name, model.sizeBytes, model.license) { ui.onDownload(model) }) },
+                onCancel = { ui.onCancelDownload(model.id) },
+                onDismissError = { ui.onDismissDownloadError(model.id) },
+                onDetails = { openPage("https://huggingface.co/${model.repo}") },
+                license = model.license
+            )
+        }
+    }
+
+    item(key = "$prefix-hub-header") { SectionHeader("Hugging Face", Modifier.padding(top = 8.dp)) }
+    item(key = "$prefix-hub") { HubCard(ui.kind.hubBody(), onOpenHub) }
+    item(key = "$prefix-import-header") { SectionHeader("Load from device", Modifier.padding(top = 8.dp)) }
+    item(key = "$prefix-import") {
+        val (body, files) = ui.kind.importBody()
+        FolderImportCard(
+            body = body,
+            files = files,
+            progress = ui.import?.takeIf { it.kind == ui.kind }?.let { Triple(it.name, it.copiedBytes, it.totalBytes) },
+            busyElsewhere = ui.import != null && ui.import.kind != ui.kind,
+            onImport = ui.onImport,
+            onCancel = ui.onCancelImport
+        )
+    }
+}
+
+private fun AuxKind.icon(): ImageVector = when (this) {
+    AuxKind.Search -> Icons.Outlined.Description
+    AuxKind.Listen -> Icons.Outlined.Mic
+    AuxKind.Speak -> Icons.Outlined.RecordVoiceOver
+}
+
 private fun LazyListScope.customDownloads(
     downloads: Map<String, ModelDownload>,
     prefix: String,
@@ -440,14 +630,16 @@ private fun LazyListScope.customDownloads(
 // region Building blocks
 
 private sealed interface Status {
-    data class Ready(val name: String) : Status
+    data class Ready(val name: String, val detail: String = "Loaded · runs on this phone") : Status
+    /** Chosen and on the phone, but not in memory yet; it loads by itself when needed. */
+    data class Standby(val name: String) : Status
     data class Loading(val name: String) : Status
     data class Failed(val message: String) : Status
     data class Idle(val title: String, val body: String) : Status
 }
 
 @Composable
-private fun StatusCard(icon: ImageVector, label: String, status: Status, ramGb: Double, onUnload: () -> Unit) {
+private fun StatusCard(icon: ImageVector, label: String, status: Status, ramGb: Double, onUnload: () -> Unit, onLoad: (() -> Unit)? = null) {
     val accent = when (status) {
         is Status.Ready -> MaterialTheme.colorScheme.tertiary
         is Status.Failed -> MaterialTheme.colorScheme.error
@@ -474,7 +666,11 @@ private fun StatusCard(icon: ImageVector, label: String, status: Status, ramGb: 
                 when (status) {
                     is Status.Ready -> {
                         Text(status.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text("Loaded · runs on this phone", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(status.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    is Status.Standby -> {
+                        Text(status.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text("Ready · loads by itself when needed", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     is Status.Loading -> {
                         Text(status.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -491,7 +687,9 @@ private fun StatusCard(icon: ImageVector, label: String, status: Status, ramGb: 
                     }
                 }
             }
-            if (status is Status.Ready) TextButton(onClick = onUnload) { Text("Unload") }
+            // The phone's built-in engines have a detail line of their own and nothing to unload.
+            if (status is Status.Ready && status.detail.startsWith("Loaded")) TextButton(onClick = onUnload) { Text("Unload") }
+            if (status is Status.Standby && onLoad != null) TextButton(onClick = onLoad) { Text("Load") }
         }
     }
 }
@@ -517,8 +715,11 @@ private fun InstalledRow(
     loaded: Boolean,
     loading: Boolean,
     onUse: () -> Unit,
-    onUnload: () -> Unit,
-    onDelete: () -> Unit
+    /** Null for the phone's own engines, which have nothing to unload or delete. */
+    onUnload: (() -> Unit)?,
+    onDelete: (() -> Unit)?,
+    /** Search and speech models load by themselves, so the chosen one is "in use" even when unloaded. */
+    loadsOnDemand: Boolean = false
 ) {
     Card(
         border = BorderStroke(
@@ -550,11 +751,17 @@ private fun InstalledRow(
                 loading -> Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                 }
-                loaded -> TextButton(onClick = onUnload) { Text("Unload") }
+                loaded && onUnload != null -> TextButton(onClick = onUnload) { Text("Unload") }
+                selected && loadsOnDemand -> Text("In use", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 12.dp))
                 else -> FilledTonalButton(onClick = onUse) { Text("Use") }
             }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete $name", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (onDelete != null) {
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.DeleteOutline, contentDescription = "Delete $name", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                Spacer(Modifier.width(12.dp))
             }
         }
     }
@@ -567,15 +774,17 @@ private fun CatalogCard(
     description: String,
     recommended: Boolean,
     tags: List<String>,
-    minRamGb: Int,
+    /** Null for small models that run on any phone. */
+    minRamGb: Int?,
     ramGb: Double,
     download: ModelDownload?,
     onDownload: () -> Unit,
     onCancel: () -> Unit,
     onDismissError: () -> Unit,
-    onDetails: (() -> Unit)?
+    onDetails: (() -> Unit)?,
+    license: String? = null
 ) {
-    val tooLittleRam = ramGb + 0.5 < minRamGb
+    val tooLittleRam = minRamGb != null && ramGb + 0.5 < minRamGb
     Card {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -587,7 +796,18 @@ private fun CatalogCard(
             Spacer(Modifier.height(10.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 tags.forEach { Tag(it, MaterialTheme.colorScheme.onSurfaceVariant) }
-                Tag("$minRamGb GB+ RAM", if (tooLittleRam) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                if (minRamGb != null) {
+                    Tag("$minRamGb GB+ RAM", if (tooLittleRam) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            // The license matters: some voices may only be used non-commercially.
+            if (license != null) {
+                Text(
+                    "License: $license",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if ("non-commercial" in license) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
             }
             if (tooLittleRam && download == null) {
                 Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -746,6 +966,63 @@ private fun ImportCard(import: ModelImport?, onImport: () -> Unit, onCancel: () 
                     Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("Choose folder")
+                }
+            }
+        }
+    }
+}
+
+/** Copies a model folder from the phone's storage, with the files it needs listed. */
+@Composable
+private fun FolderImportCard(
+    body: String,
+    files: String,
+    /** (name, copied, total) while this kind is being imported. */
+    progress: Triple<String, Long, Long>?,
+    /** Another kind is importing; one import runs at a time. */
+    busyElsewhere: Boolean,
+    onImport: () -> Unit,
+    onCancel: () -> Unit
+) {
+    Card {
+        Column(Modifier.padding(16.dp)) {
+            Text("Import a model folder", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
+            Text(body, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(8.dp))
+            Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
+                Text(
+                    files,
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    modifier = Modifier.fillMaxWidth().padding(12.dp)
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            if (progress != null) {
+                val (name, copied, total) = progress
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        LinearProgressIndicator(
+                            progress = { if (total > 0) (copied.toFloat() / total).coerceIn(0f, 1f) else 0f },
+                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                            drawStopIndicator = {}
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Copying $name · ${formatBytes(copied)} of ${formatBytes(total)}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(onClick = onCancel) { Icon(Icons.Default.Close, contentDescription = "Cancel import") }
+                }
+            } else {
+                OutlinedButton(onClick = onImport, enabled = !busyElsewhere, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (busyElsewhere) "Another model is being imported…" else "Choose folder")
                 }
             }
         }

@@ -43,6 +43,9 @@ object ResponseParser {
         }
     }
 
+    /** True once either reasoning tag has appeared in [raw]: the model thinks before answering. */
+    fun hasThinkingTag(raw: String): Boolean = openTag.containsMatchIn(raw) || closeTag.containsMatchIn(raw)
+
     /** True once the closing reasoning tag has appeared in [raw]. */
     fun hasFinishedThinking(raw: String): Boolean = closeTag.containsMatchIn(raw)
 

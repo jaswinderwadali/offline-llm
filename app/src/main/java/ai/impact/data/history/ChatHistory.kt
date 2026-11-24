@@ -82,6 +82,12 @@ class ChatHistoryRepository(private val dao: ChatHistoryDao) {
 
     suspend fun delete(conversationId: Long) = dao.deleteConversation(conversationId)
 
+    /** Renames a chat; a blank name is ignored. */
+    suspend fun rename(conversationId: Long, title: String) {
+        val clean = title.trim().replace(Regex("\\s+"), " ").take(80)
+        if (clean.isNotEmpty()) dao.rename(conversationId, clean)
+    }
+
     suspend fun deleteForPersona(personaId: String) = dao.deleteForPersona(personaId)
 
     suspend fun deleteAll() = dao.deleteAll()

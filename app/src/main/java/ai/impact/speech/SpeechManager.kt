@@ -1,5 +1,6 @@
 package ai.impact.speech
 
+import ai.impact.models.AuxModelStore
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,7 +25,7 @@ class SpeechManager(context: Context, private val scope: CoroutineScope) {
 
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
-    val models = SpeechModelStore(appContext, scope)
+    val models = AuxModelStore(appContext, scope, prefsName = "speech_models", relativeRoot = "speech_models", catalog = SpeechCatalog.models)
 
     private val _listenEngine = MutableStateFlow(prefs.getString(KEY_LISTEN, SYSTEM) ?: SYSTEM)
     val listenEngine: StateFlow<String> = _listenEngine.asStateFlow()
@@ -93,10 +94,10 @@ class SpeechManager(context: Context, private val scope: CoroutineScope) {
     }
 
     /** What the user says next, or "" if they say nothing. */
-    suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit): String {
+    suspend fun listen(onLevel: (Float) -> Unit, onPartial: (String) -> Unit, onFinished: () -> Unit = {}): String {
         val l = currentListener()
         return try {
-            l.listen(onLevel, onPartial)
+            l.listen(onLevel, onPartial, onFinished)
         } finally {
             _listenLoaded.value = (l as? WhisperListener)?.isLoaded == true
         }
