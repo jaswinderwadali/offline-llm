@@ -67,7 +67,6 @@ jobs:
           track: internal
           inAppUpdatePriority: 2
           mappingFile: ${{ env.MAPPING }}
-          changesNotSentForReview: true
 
       - name: Clean up
         if: always()
